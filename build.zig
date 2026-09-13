@@ -154,7 +154,7 @@ pub fn build(b: *std.Build) void {
         },
     }
 
-    const mod = b.addModule("engine", .{
+    const mod = b.addModule("onnx", .{
         .root_source_file = b.path("src/runtime.zig"),
         .target = target,
         .optimize = optimize,

@@ -1,9 +1,9 @@
 .{
-    .name = .engine,
+    .name = .onnx,
 
     .version = "0.0.0",
 
-    .fingerprint = 0xe8a81a8d965b7cd4,
+    .fingerprint = 0xa5e8614405a9d04b,
 
     .minimum_zig_version = "0.16.0",
 
