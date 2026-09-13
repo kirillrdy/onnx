@@ -431,14 +431,18 @@ pub fn Buffer(comptime T: type) type {
         }
 
         pub fn upload(self: Self, host: []const T) Error!void {
-            std.debug.assert(host.len <= self.len);
+            return self.uploadAt(0, host);
+        }
+
+        pub fn uploadAt(self: Self, offset: usize, host: []const T) Error!void {
+            std.debug.assert(offset + host.len <= self.len);
             if (host.len == 0 or self.ptr == null) return;
             const ctx = self.context orelse global_context orelse return Error.OpenCL;
             try check(ctx.dispatch.clEnqueueWriteBuffer.?(
                 ctx.queue,
                 @ptrCast(self.ptr),
                 1,
-                0,
+                offset * @sizeOf(T),
                 host.len * @sizeOf(T),
                 host.ptr,
                 0,
