@@ -4692,7 +4692,7 @@ fn uploadFloats(allocator: std.mem.Allocator, buffer: driver.Buffer(Element), so
     while (start < source.len) {
         const part = source[start..@min(start + window, source.len)];
         for (scratch[0..part.len], part) |*narrow, value| narrow.* = @floatCast(value);
-        try buffer.slice(start, part.len).upload(scratch[0..part.len]);
+        try buffer.uploadAt(start, scratch[0..part.len]);
         start += part.len;
     }
 }

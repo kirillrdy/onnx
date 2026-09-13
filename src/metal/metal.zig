@@ -113,13 +113,21 @@ pub fn Buffer(comptime T: type) type {
         }
 
         pub fn upload(self: Self, host: []const T) Error!void {
-            std.debug.assert(host.len <= self.len);
+            return self.uploadAt(0, host);
+        }
+
+        pub fn uploadAt(self: Self, offset: usize, host: []const T) Error!void {
+            std.debug.assert(offset + host.len <= self.len);
             if (host.len == 0) return;
             // A direct shared-memory write must not overtake kernels already
             // reading this buffer. Synchronous uploads are uncommon graph
             // boundaries, so retire the queue before exposing the write.
             if (current_context) |context| try context.synchronize();
-            c.sam_metal_buffer_upload(@bitCast(self.ptr), host.ptr, host.len * @sizeOf(T));
+            const destination: DevicePtr = .{
+                .buffer = self.ptr.buffer,
+                .offset = self.ptr.offset + offset * @sizeOf(T),
+            };
+            c.sam_metal_buffer_upload(@bitCast(destination), host.ptr, host.len * @sizeOf(T));
         }
         pub fn uploadAsync(self: Self, host: []const T) Error!void {
             std.debug.assert(host.len <= self.len);

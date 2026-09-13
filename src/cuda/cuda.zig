@@ -246,9 +246,13 @@ pub fn Buffer(comptime T: type) type {
         }
 
         pub fn upload(self: Self, host: []const T) Error!void {
-            std.debug.assert(host.len <= self.len);
+            return self.uploadAt(0, host);
+        }
+
+        pub fn uploadAt(self: Self, offset: usize, host: []const T) Error!void {
+            std.debug.assert(offset + host.len <= self.len);
             if (host.len == 0) return;
-            try check(cuMemcpyHtoD_v2(self.ptr, host.ptr, host.len * @sizeOf(T)));
+            try check(cuMemcpyHtoD_v2(self.ptr + offset * @sizeOf(T), host.ptr, host.len * @sizeOf(T)));
         }
 
         pub fn download(self: Self, host: []T) Error!void {
