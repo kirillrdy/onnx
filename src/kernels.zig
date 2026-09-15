@@ -1358,6 +1358,107 @@ fn maxPool2d(
     dst[i] = top;
 }
 
+/// Average pooling with ONNX Runtime's divisor rule: the whole kernel area
+/// with count_include_pad (even where the window overhangs), else the input
+/// pixels covered.
+/// meta: in_h, in_w, out_h, out_w, kernel_h, kernel_w, stride_h, stride_w,
+///       pad_h, pad_w, count_include_pad
+fn avgPool2d(
+    src: [*]addrspace(.global) const f32,
+    dst: [*]addrspace(.global) f32,
+    meta: Meta,
+    count: u32,
+) callconv(.kernel) void {
+    const i = gpu.globalIndex();
+    if (i >= count) return;
+
+    const in_h: i32 = @intCast(meta[0]);
+    const in_w: i32 = @intCast(meta[1]);
+    const out_h = meta[2];
+    const out_w = meta[3];
+    const kernel_h: i32 = @intCast(meta[4]);
+    const kernel_w: i32 = @intCast(meta[5]);
+
+    const out_x = i % out_w;
+    const out_y = (i / out_w) % out_h;
+    const plane = i / (out_w * out_h);
+
+    var hstart: i32 = @as(i32, @intCast(out_y * meta[6])) - @as(i32, @intCast(meta[8]));
+    var wstart: i32 = @as(i32, @intCast(out_x * meta[7])) - @as(i32, @intCast(meta[9]));
+    var hend: i32 = hstart + kernel_h;
+    var wend: i32 = wstart + kernel_w;
+    hstart = @max(hstart, 0);
+    wstart = @max(wstart, 0);
+    hend = @min(hend, in_h);
+    wend = @min(wend, in_w);
+
+    var total: f32 = 0;
+    var y = hstart;
+    while (y < hend) : (y += 1) {
+        var x = wstart;
+        while (x < wend) : (x += 1) {
+            total += src[(plane * @as(u32, @intCast(in_h)) + @as(u32, @intCast(y))) * @as(u32, @intCast(in_w)) + @as(u32, @intCast(x))];
+        }
+    }
+    const divisor = if (meta[10] != 0) kernel_h * kernel_w else (hend - hstart) * (wend - wstart);
+    dst[i] = total / @as(f32, @floatFromInt(divisor));
+}
+
+/// Bilinear GridSample with zero padding and align_corners = 0, following
+/// ONNX Runtime's corner weights. x: n x c x in_h x in_w, grid: n x out_h x
+/// out_w x 2 normalized (x, y) in [-1, 1], out: n x c x out_h x out_w.
+/// meta: channels, in_h, in_w, out_h, out_w
+fn gridSample(
+    src: [*]addrspace(.global) const f32,
+    grid: [*]addrspace(.global) const f32,
+    dst: [*]addrspace(.global) f32,
+    meta: Meta,
+    count: u32,
+) callconv(.kernel) void {
+    const i = gpu.globalIndex();
+    if (i >= count) return;
+
+    const channels = meta[0];
+    const in_h: i32 = @intCast(meta[1]);
+    const in_w: i32 = @intCast(meta[2]);
+    const out_h = meta[3];
+    const out_w = meta[4];
+
+    const ox = i % out_w;
+    const oy = (i / out_w) % out_h;
+    const c = (i / (out_w * out_h)) % channels;
+    const n = i / (out_w * out_h * channels);
+
+    const g = ((n * out_h + oy) * out_w + ox) * 2;
+    var x = (grid[g] + 1.0) * @as(f32, @floatFromInt(in_w));
+    x = (x - 1.0) / 2.0;
+    var y = (grid[g + 1] + 1.0) * @as(f32, @floatFromInt(in_h));
+    y = (y - 1.0) / 2.0;
+
+    const fx1 = @floor(x);
+    const fy1 = @floor(y);
+    const x1: i32 = @intFromFloat(fx1);
+    const y1: i32 = @intFromFloat(fy1);
+    const x2 = x1 + 1;
+    const y2 = y1 + 1;
+    const dx2 = fx1 + 1.0 - x;
+    const dx1 = x - fx1;
+    const dy2 = fy1 + 1.0 - y;
+    const dy1 = y - fy1;
+
+    const base = (n * channels + c) * @as(u32, @intCast(in_h * in_w));
+    const p11 = pixelOrZero(src, base, in_h, in_w, y1, x1);
+    const p21 = pixelOrZero(src, base, in_h, in_w, y1, x2);
+    const p12 = pixelOrZero(src, base, in_h, in_w, y2, x1);
+    const p22 = pixelOrZero(src, base, in_h, in_w, y2, x2);
+    dst[i] = dy2 * (dx2 * p11 + dx1 * p21) + dy1 * (dx2 * p12 + dx1 * p22);
+}
+
+inline fn pixelOrZero(src: [*]addrspace(.global) const f32, base: u32, in_h: i32, in_w: i32, y: i32, x: i32) f32 {
+    if (x < 0 or x >= in_w or y < 0 or y >= in_h) return 0;
+    return src[base + @as(u32, @intCast(y)) * @as(u32, @intCast(in_w)) + @as(u32, @intCast(x))];
+}
+
 /// Convolution as an implicit GEMM: out[channel, pixel] is the weight matrix,
 /// already laid out as `out_channels` x `in_channels * kernel_h * kernel_w`,
 /// times the patch matrix that an im2col would build. The patch matrix is
@@ -1786,7 +1887,7 @@ fn attention(
 export fn anchor() usize {
     return @intFromPtr(&binary) ^ @intFromPtr(&unary) ^ @intFromPtr(&copy) ^
         @intFromPtr(&fill) ^ @intFromPtr(&select) ^ @intFromPtr(&tile) ^ @intFromPtr(&conv2dGemm) ^
-        @intFromPtr(&matmulNBits) ^ @intFromPtr(&cumulativeSum) ^ @intFromPtr(&maxPool2d) ^
+        @intFromPtr(&matmulNBits) ^ @intFromPtr(&cumulativeSum) ^ @intFromPtr(&maxPool2d) ^ @intFromPtr(&avgPool2d) ^ @intFromPtr(&gridSample) ^
         @intFromPtr(&sumAxes) ^ @intFromPtr(&resizeNearest) ^ @intFromPtr(&instanceNorm) ^
         @intFromPtr(&clip) ^ @intFromPtr(&scatter) ^
         @intFromPtr(&concatCopy) ^ @intFromPtr(&pad) ^

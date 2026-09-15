@@ -1838,3 +1838,105 @@ kernel void conv2dGemmTensor(
 }
 
 #endif
+
+// Average pooling with ONNX Runtime's divisor rule: the whole kernel area with
+// count_include_pad (even where the window overhangs), else the input pixels
+// covered.
+// meta: in_h, in_w, out_h, out_w, kernel_h, kernel_w, stride_h, stride_w,
+//       pad_h, pad_w, count_include_pad
+kernel void avgPool2d(
+    device const real* src [[buffer(0)]],
+    device real* dst [[buffer(1)]],
+    device const uint* meta [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]],
+    uint3 threads_per_group [[threads_per_threadgroup]]
+) {
+    uint i = get_global_id(0);
+    if (i >= count) return;
+
+    int in_h = (int)meta[0];
+    int in_w = (int)meta[1];
+    uint out_h = meta[2];
+    uint out_w = meta[3];
+    int kernel_h = (int)meta[4];
+    int kernel_w = (int)meta[5];
+
+    uint out_x = i % out_w;
+    uint out_y = (i / out_w) % out_h;
+    uint plane = i / (out_w * out_h);
+
+    int hstart = (int)(out_y * meta[6]) - (int)meta[8];
+    int wstart = (int)(out_x * meta[7]) - (int)meta[9];
+    int hend = hstart + kernel_h;
+    int wend = wstart + kernel_w;
+    hstart = max(hstart, 0);
+    wstart = max(wstart, 0);
+    hend = min(hend, in_h);
+    wend = min(wend, in_w);
+
+    float total = 0.0f;
+    for (int y = hstart; y < hend; y++) {
+        for (int x = wstart; x < wend; x++) {
+            total += (float)src[(plane * in_h + y) * in_w + x];
+        }
+    }
+    int divisor = meta[10] != 0 ? kernel_h * kernel_w : (hend - hstart) * (wend - wstart);
+    dst[i] = total / (float)divisor;
+}
+
+// Bilinear GridSample with zero padding and align_corners = 0, following
+// ONNX Runtime's corner weights. x: n x c x in_h x in_w, grid: n x out_h x
+// out_w x 2 normalized (x, y) in [-1, 1], out: n x c x out_h x out_w.
+// meta: channels, in_h, in_w, out_h, out_w
+kernel void gridSample(
+    device const real* src [[buffer(0)]],
+    device const real* grid [[buffer(1)]],
+    device real* dst [[buffer(2)]],
+    device const uint* meta [[buffer(3)]],
+    constant uint& count [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]],
+    uint3 threads_per_group [[threads_per_threadgroup]]
+) {
+    uint i = get_global_id(0);
+    if (i >= count) return;
+
+    uint channels = meta[0];
+    int in_h = (int)meta[1];
+    int in_w = (int)meta[2];
+    uint out_h = meta[3];
+    uint out_w = meta[4];
+
+    uint ox = i % out_w;
+    uint oy = (i / out_w) % out_h;
+    uint c = (i / (out_w * out_h)) % channels;
+    uint n = i / (out_w * out_h * channels);
+
+    uint g = ((n * out_h + oy) * out_w + ox) * 2;
+    float x = ((float)grid[g] + 1.0f) * (float)in_w;
+    x = (x - 1.0f) / 2.0f;
+    float y = ((float)grid[g + 1] + 1.0f) * (float)in_h;
+    y = (y - 1.0f) / 2.0f;
+
+    float fx1 = floor(x);
+    float fy1 = floor(y);
+    int x1 = (int)fx1;
+    int y1 = (int)fy1;
+    int x2 = x1 + 1;
+    int y2 = y1 + 1;
+    float dx2 = fx1 + 1.0f - x;
+    float dx1 = x - fx1;
+    float dy2 = fy1 + 1.0f - y;
+    float dy1 = y - fy1;
+
+    device const real* plane = src + (n * channels + c) * (uint)(in_h * in_w);
+    float p11 = (x1 >= 0 && x1 < in_w && y1 >= 0 && y1 < in_h) ? (float)plane[y1 * in_w + x1] : 0.0f;
+    float p21 = (x2 >= 0 && x2 < in_w && y1 >= 0 && y1 < in_h) ? (float)plane[y1 * in_w + x2] : 0.0f;
+    float p12 = (x1 >= 0 && x1 < in_w && y2 >= 0 && y2 < in_h) ? (float)plane[y2 * in_w + x1] : 0.0f;
+    float p22 = (x2 >= 0 && x2 < in_w && y2 >= 0 && y2 < in_h) ? (float)plane[y2 * in_w + x2] : 0.0f;
+    dst[i] = dy2 * (dx2 * p11 + dx1 * p21) + dy1 * (dx2 * p12 + dx1 * p22);
+}
