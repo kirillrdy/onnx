@@ -1323,6 +1323,7 @@ const SessionState = struct {
         if (std.mem.eql(u8, node.op_type, "MatMulInteger")) return self.matmulInteger(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "DequantizeLinear")) return self.dequantizeLinear(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "QuantizeLinear")) return self.quantizeLinear(arena, values, node);
+        if (std.mem.eql(u8, node.op_type, "GlobalAveragePool")) return self.globalAveragePool(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "ReduceMean")) return self.reduceMean(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "ReduceMax")) return self.reduceMax(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "LSTM")) return self.lstm(arena, values, node);
@@ -3027,12 +3028,29 @@ const SessionState = struct {
         if (!attributeIs(node, "mode", "nearest", "nearest")) return Error.UnsupportedOperator;
         if (!attributeIs(node, "nearest_mode", "round_prefer_floor", "floor")) return Error.UnsupportedOperator;
         if (!attributeIs(node, "coordinate_transformation_mode", "half_pixel", "asymmetric")) return Error.UnsupportedOperator;
-        if (node.inputs.len < 4 or node.inputs[3].len == 0) return Error.UnsupportedOperator;
         const rank = x.dims.len;
         if (rank > max_rank) return Error.RankTooLarge;
 
-        const dims = try arena.dupe(i64, try (try self.input(arena, values, node.inputs[3])).i64s());
-        if (dims.len != rank) return Error.InvalidShape;
+        const dims = try arena.alloc(i64, rank);
+        if (node.inputs.len >= 4 and node.inputs[3].len != 0) {
+            const sizes = try (try self.input(arena, values, node.inputs[3])).i64s();
+            if (sizes.len != rank) return Error.InvalidShape;
+            @memcpy(dims, sizes);
+        } else if (node.inputs.len >= 3 and node.inputs[2].len != 0) {
+            // The `scales` spelling: each output extent is floor(in * scale).
+            // The kernel maps coordinates through in/out, which equals 1/scale
+            // only when in * scale is integral, so other scales are refused
+            // rather than approximated.
+            const source = self.graph.constant(node.inputs[2]) orelse self.constantNode(node.inputs[2]) orelse return Error.UnsupportedOperator;
+            if (source.dtype != .f32) return Error.UnsupportedDataType;
+            const scales = source.f32s();
+            if (scales.len != rank) return Error.InvalidShape;
+            for (dims, x.dims, scales) |*dim, in, scale| {
+                const extent = @as(f32, @floatFromInt(in)) * scale;
+                if (!(scale > 0) or extent != @floor(extent)) return Error.UnsupportedOperator;
+                dim.* = @intFromFloat(extent);
+            }
+        } else return Error.UnsupportedOperator;
         const count = try elementCount(dims);
 
         var strides: [max_rank]u32 = @splat(0);
@@ -4072,6 +4090,22 @@ const SessionState = struct {
             .dims = dims,
             .data = .{ .host = y },
         });
+    }
+
+    fn globalAveragePool(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
+        const x = try self.input(arena, values, node.inputs[0]);
+        if (x.dims.len < 3) return Error.InvalidShape;
+        if (x.dims.len > max_rank) return Error.RankTooLarge;
+        if (x.dtype != .f32) return Error.UnsupportedOperator;
+        const axes = try arena.alloc(i64, x.dims.len - 2);
+        for (axes, 0..) |*axis, i| axis.* = @intCast(i + 2);
+        // Global pooling preserves batch/channel axes and collapses all spatial axes.
+        var reduction = node;
+        reduction.attributes = &.{
+            .{ .name = "axes", .ints = axes },
+            .{ .name = "keepdims", .i = 1 },
+        };
+        return self.reduceMean(arena, values, reduction);
     }
 
     fn reduceMean(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {

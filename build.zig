@@ -164,6 +164,7 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption(bool, "half", half and backend != .cuda);
+    options.addOption(bool, "reduced_precision", b.option(bool, "reduced-precision", "Allow matrix kernels that narrow float32 operands") orelse true);
     mod.addOptions("build_options", options);
 
     const tests = b.addTest(.{ .root_module = mod });
