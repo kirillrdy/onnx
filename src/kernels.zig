@@ -18,7 +18,7 @@ const neg_inf: f32 = -inf;
 const Binary = enum(u32) { add, sub, mul, div, pow, min, max, equal, less, greater };
 
 /// Elementwise unary operations, selected by `op`.
-const Unary = enum(u32) { neg, erf, exp, sqrt, reciprocal, sigmoid, tanh, relu, abs, floor, sin, cos, log, sign, is_nan, gelu };
+const Unary = enum(u32) { neg, erf, exp, sqrt, reciprocal, sigmoid, tanh, relu, abs, floor, sin, cos, log, sign, is_nan, gelu, ceil, round, leaky_relu };
 
 const Meta = [*]addrspace(.global) const u32;
 
@@ -89,6 +89,7 @@ fn unary(
     out: [*]addrspace(.global) f32,
     count: u32,
     op: u32,
+    alpha: f32,
 ) callconv(.kernel) void {
     const i = gpu.globalIndex();
     if (i >= count) return;
@@ -114,7 +115,18 @@ fn unary(
         .is_nan => if (v != v) 1 else 0,
         // 1 / sqrt(2), which is what the graph divides by before the erf.
         .gelu => 0.5 * v * (1.0 + erf(v * 0.7071067811865476)),
+        .ceil => @ceil(v),
+        .round => roundEven(v),
+        .leaky_relu => if (v > 0) v else alpha * v,
     };
+}
+
+/// Rounds halfway cases to the even neighbour, as ONNX specifies and @round
+/// does not: it rounds them away from zero.
+fn roundEven(v: f32) f32 {
+    const r = @round(v);
+    if (@abs(v - @trunc(v)) == 0.5 and @rem(r, 2) != 0) return if (v > 0) r - 1 else r + 1;
+    return r;
 }
 
 /// Abramowitz and Stegun 7.1.26, the approximation PyTorch's GELU is built on.
