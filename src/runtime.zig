@@ -1314,8 +1314,8 @@ const SessionState = struct {
         if (std.mem.eql(u8, node.op_type, "Resize")) return self.resize(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "InstanceNormalization")) return self.instanceNorm(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "CumSum")) return self.cumulativeSum(arena, values, node);
-        if (std.mem.eql(u8, node.op_type, "MaxPool")) return self.maxPool(arena, values, node);
-        if (std.mem.eql(u8, node.op_type, "AveragePool")) return self.averagePool(arena, values, node);
+        if (std.mem.eql(u8, node.op_type, "MaxPool")) return self.pool2d(arena, values, node, .max);
+        if (std.mem.eql(u8, node.op_type, "AveragePool")) return self.pool2d(arena, values, node, .average);
         if (std.mem.eql(u8, node.op_type, "GridSample")) return self.gridSample(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "TopK")) return self.topK(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "GatherElements")) return self.gatherElements(arena, values, node);
@@ -3045,9 +3045,7 @@ const SessionState = struct {
             // The kernel maps coordinates through in/out, which equals 1/scale
             // only when in * scale is integral, so other scales are refused
             // rather than approximated.
-            const source = self.graph.constant(node.inputs[2]) orelse self.constantNode(node.inputs[2]) orelse return Error.UnsupportedOperator;
-            if (source.dtype != .f32) return Error.UnsupportedDataType;
-            const scales = source.f32s();
+            const scales = try self.hostFloats(arena, node.inputs[2], try self.input(arena, values, node.inputs[2]));
             if (scales.len != rank) return Error.InvalidShape;
             for (dims, x.dims, scales) |*dim, in, scale| {
                 const extent = @as(f32, @floatFromInt(in)) * scale;
@@ -3215,43 +3213,10 @@ const SessionState = struct {
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
-    fn maxPool(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
-        const x = try self.input(arena, values, node.inputs[0]);
-        if (x.dims.len != 4 or node.outputs.len > 1) return Error.UnsupportedOperator;
-        const kernel = node.ints("kernel_shape");
-        if (kernel.len != 2) return Error.UnsupportedOperator;
-        const strides = node.ints("strides");
-        const pads = node.ints("pads");
-        const dilations = node.ints("dilations");
-        for (dilations) |dilation| if (dilation != 1) return Error.UnsupportedOperator;
-        const sh: i64 = if (strides.len == 0) 1 else strides[0];
-        const sw: i64 = if (strides.len == 0) 1 else strides[1];
-        const ph0: i64 = if (pads.len == 0) 0 else pads[0];
-        const pw0: i64 = if (pads.len == 0) 0 else pads[1];
-        const ph1: i64 = if (pads.len < 4) ph0 else pads[2];
-        const pw1: i64 = if (pads.len < 4) pw0 else pads[3];
-        const out_h = @divFloor(x.dims[2] + ph0 + ph1 - kernel[0], sh) + 1;
-        const out_w = @divFloor(x.dims[3] + pw0 + pw1 - kernel[1], sw) + 1;
-
-        const dims = try arena.dupe(i64, &.{ x.dims[0], x.dims[1], out_h, out_w });
-        const count = try elementCount(dims);
-        const storage = try self.newStorage(count);
-        errdefer self.releaseStorage(storage);
-        const meta = [_]u32{
-            @intCast(x.dims[2]), @intCast(x.dims[3]), @intCast(out_h), @intCast(out_w),
-            @intCast(kernel[0]), @intCast(kernel[1]), @intCast(sh),    @intCast(sw),
-            @intCast(ph0),       @intCast(pw0),
-        };
-        try self.env.uploadMetadata(&meta);
-        const xb = try x.gpuBuffer();
-        const block: u32 = 256;
-        try self.env.gpu.max_pool2d.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
-            xb.ptr, storage.buffer.ptr, self.env.metadata.ptr, @as(u32, @intCast(count)),
-        });
-        try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
-    }
-
-    fn averagePool(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
+    /// MaxPool and AveragePool share their window geometry; the average kernel
+    /// also takes ONNX Runtime's divisor rule: the full kernel area when padding
+    /// counts, else the covered input pixels.
+    fn pool2d(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node, comptime kind: enum { max, average }) !void {
         const x = try self.input(arena, values, node.inputs[0]);
         if (x.dims.len != 4 or node.outputs.len > 1) return Error.UnsupportedOperator;
         const kernel = node.ints("kernel_shape");
@@ -3277,14 +3242,18 @@ const SessionState = struct {
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
         const meta = [_]u32{
-            @intCast(x.dims[2]), @intCast(x.dims[3]), @intCast(out_h),                                     @intCast(out_w),
-            @intCast(kernel[0]), @intCast(kernel[1]), @intCast(sh),                                        @intCast(sw),
-            @intCast(ph0),       @intCast(pw0),       @intFromBool(node.int("count_include_pad", 0) != 0),
+            @intCast(x.dims[2]), @intCast(x.dims[3]), @intCast(out_h),                                                          @intCast(out_w),
+            @intCast(kernel[0]), @intCast(kernel[1]), @intCast(sh),                                                             @intCast(sw),
+            @intCast(ph0),       @intCast(pw0),       @intFromBool(kind == .average and node.int("count_include_pad", 0) != 0),
         };
         try self.env.uploadMetadata(&meta);
         const xb = try x.gpuBuffer();
         const block: u32 = 256;
-        try self.env.gpu.avg_pool2d.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
+        const function = switch (kind) {
+            .max => self.env.gpu.max_pool2d,
+            .average => self.env.gpu.avg_pool2d,
+        };
+        try function.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
             xb.ptr, storage.buffer.ptr, self.env.metadata.ptr, @as(u32, @intCast(count)),
         });
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
@@ -3333,26 +3302,26 @@ const SessionState = struct {
         const rows = try elementCount(x.dims[0 .. x.dims.len - 1]);
         const source = try self.hostFloats(arena, node.inputs[0], x);
 
+        const Order = struct {
+            scores: []const f32,
+            largest: bool,
+            fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                const sa = ctx.scores[a];
+                const sb = ctx.scores[b];
+                if (sa == sb) return a < b;
+                return if (ctx.largest) sa > sb else sa < sb;
+            }
+        };
         const out_values = try arena.alloc(f32, rows * k);
         const out_indices = try arena.alloc(i64, rows * k);
         const order = try arena.alloc(u32, width);
         for (0..rows) |row| {
             const scores = source[row * width ..][0..width];
             for (order, 0..) |*index, i| index.* = @intCast(i);
-            const Context = struct {
-                scores: []const f32,
-                largest: bool,
-                fn lessThan(ctx: @This(), a: u32, b: u32) bool {
-                    const sa = ctx.scores[a];
-                    const sb = ctx.scores[b];
-                    if (sa == sb) return a < b;
-                    return if (ctx.largest) sa > sb else sa < sb;
-                }
-            };
-            std.mem.sort(u32, order, Context{ .scores = scores, .largest = largest }, Context.lessThan);
-            for (0..k) |i| {
-                out_values[row * k + i] = scores[order[i]];
-                out_indices[row * k + i] = order[i];
+            std.mem.sort(u32, order, Order{ .scores = scores, .largest = largest }, Order.lessThan);
+            for (out_values[row * k ..][0..k], out_indices[row * k ..][0..k], order[0..k]) |*value, *index, best| {
+                value.* = scores[best];
+                index.* = best;
             }
         }
         const dims = try arena.dupe(i64, x.dims);
@@ -3394,18 +3363,17 @@ const SessionState = struct {
             source.* = offset;
         }
         const dims = try arena.dupe(i64, indices.dims);
-        if (data.dtype == .f32) {
-            const floats = try self.hostFloats(arena, node.inputs[0], data);
-            const out = try arena.alloc(f32, count);
-            for (out, sources) |*value, index| value.* = floats[index];
-            const storage = try self.newStorage(count);
-            errdefer self.releaseStorage(storage);
-            try uploadFloats(arena, storage.buffer, out);
-            return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+        if (data.onHost()) {
+            const out = try hostSelect(arena, data.*, sources);
+            return self.put(arena, values, node.outputs[0], .{ .dtype = data.dtype, .dims = dims, .data = .{ .host = out } });
         }
-        if (!data.onHost()) return Error.UnsupportedDataType;
-        const out = try hostSelect(arena, data.*, sources);
-        try self.put(arena, values, node.outputs[0], .{ .dtype = data.dtype, .dims = dims, .data = .{ .host = out } });
+        const floats = try self.hostFloats(arena, node.inputs[0], data);
+        const out = try arena.alloc(f32, count);
+        for (out, sources) |*value, index| value.* = floats[index];
+        const storage = try self.newStorage(count);
+        errdefer self.releaseStorage(storage);
+        try uploadFloats(arena, storage.buffer, out);
+        try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
     fn identity(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
@@ -4256,16 +4224,11 @@ const SessionState = struct {
     fn globalAveragePool(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
         const x = try self.input(arena, values, node.inputs[0]);
         if (x.dims.len < 3) return Error.InvalidShape;
-        if (x.dims.len > max_rank) return Error.RankTooLarge;
-        if (x.dtype != .f32) return Error.UnsupportedOperator;
+        // Global pooling keeps the batch and channel axes and collapses the rest.
         const axes = try arena.alloc(i64, x.dims.len - 2);
         for (axes, 0..) |*axis, i| axis.* = @intCast(i + 2);
-        // Global pooling preserves batch/channel axes and collapses all spatial axes.
         var reduction = node;
-        reduction.attributes = &.{
-            .{ .name = "axes", .ints = axes },
-            .{ .name = "keepdims", .i = 1 },
-        };
+        reduction.attributes = &.{ .{ .name = "axes", .ints = axes }, .{ .name = "keepdims", .i = 1 } };
         return self.reduceMean(arena, values, reduction);
     }
 

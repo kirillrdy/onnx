@@ -135,14 +135,14 @@ pub const Device = struct {
             .matmul_post = module.function("matmulPost") catch null,
             // A build that compiled the kernel out leaves no symbol behind, so
             // failing to find it is the answer rather than an error.
-            .matmul_tensor = if (build_options.reduced_precision) module.function("matmulTensor") catch null else null,
+            .matmul_tensor = narrowing(module, "matmulTensor"),
             .matmul_simd = module.function("matmulSimd") catch null,
-            .matmul_xmx = if (build_options.reduced_precision) module.function("matmulXmx") catch null else null,
-            .matmul_xmx_block = if (build_options.reduced_precision) module.function("matmulXmxBlock") catch null else null,
+            .matmul_xmx = narrowing(module, "matmulXmx"),
+            .matmul_xmx_block = narrowing(module, "matmulXmxBlock"),
             .conv2d = try module.function("conv2d"),
             .conv2d_gemm = try module.function("conv2dGemm"),
-            .conv2d_gemm_xmx = if (build_options.reduced_precision) module.function("conv2dGemmXmx") catch null else null,
-            .conv2d_gemm_tensor = if (build_options.reduced_precision) module.function("conv2dGemmTensor") catch null else null,
+            .conv2d_gemm_xmx = narrowing(module, "conv2dGemmXmx"),
+            .conv2d_gemm_tensor = narrowing(module, "conv2dGemmTensor"),
             .matmul_nbits = try module.function("matmulNBits"),
             .matmul_nbits_tensor = module.function("matmulNBitsTensor") catch null,
             .cumulative_sum = try module.function("cumulativeSum"),
@@ -156,6 +156,13 @@ pub const Device = struct {
             .conv_transpose2d_gemm = try module.function("convTranspose2dGemm"),
             .pixel_shuffle = module.function("pixelShuffle") catch null,
         };
+    }
+
+    /// A matrix kernel that narrows float32 operands; left unloaded when the
+    /// build opts out of reduced precision.
+    fn narrowing(module: driver.Module, name: []const u8) ?driver.Function {
+        if (!build_options.reduced_precision) return null;
+        return module.function(name) catch null;
     }
 
     pub fn deinit(self: *Device) void {
