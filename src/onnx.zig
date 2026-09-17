@@ -63,6 +63,10 @@ pub const Attribute = struct {
     ints: []const i64 = &.{},
     floats: []const f32 = &.{},
     tensor: ?Tensor = null,
+    /// The body of a control-flow operator. It shares the arena and the
+    /// weight mapping of the graph that carries it, so it is never deinited
+    /// on its own.
+    graph: ?*const Graph = null,
 };
 
 pub const Node = struct {
@@ -307,7 +311,9 @@ const Parser = struct {
         return .{ .key = key, .value = value };
     }
 
-    fn parseGraph(self: *Parser, reader: Reader) !Graph {
+    // A node attribute can hold a graph, so this recurses through
+    // `parseAttribute` and cannot infer its error set.
+    fn parseGraph(self: *Parser, reader: Reader) anyerror!Graph {
         var r = reader;
         var nodes: std.ArrayList(Node) = .empty;
         var initializers: std.ArrayList(Tensor) = .empty;
@@ -382,6 +388,11 @@ const Parser = struct {
                 3 => attribute.i = @bitCast(try r.varint()),
                 4 => attribute.s = try r.slice(),
                 5 => attribute.tensor = try self.parseTensor(try r.sub()),
+                6 => {
+                    const graph = try self.arena.create(Graph);
+                    graph.* = try self.parseGraph(try r.sub());
+                    attribute.graph = graph;
+                },
                 7 => try self.appendF32(&floats, &r, f.wire),
                 8 => try self.appendI64(&ints, &r, f.wire),
                 else => try r.skip(f.wire),

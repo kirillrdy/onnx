@@ -34,7 +34,7 @@ enum Unary {
     UN_NEG = 0, UN_ERF = 1, UN_EXP = 2, UN_SQRT = 3, UN_RECIP = 4,
     UN_SIGMOID = 5, UN_TANH = 6, UN_RELU = 7, UN_ABS = 8, UN_FLOOR = 9,
     UN_SIN = 10, UN_COS = 11, UN_LOG = 12, UN_SIGN = 13, UN_IS_NAN = 14,
-    UN_GELU = 15
+    UN_GELU = 15, UN_CEIL = 16, UN_ROUND = 17, UN_LEAKY_RELU = 18
 };
 
 inline uint offsetOf(uint index, device const uint* meta, uint dims_at, uint strides_at, uint rank) {
@@ -156,6 +156,7 @@ kernel void unary(
     device real* out [[buffer(1)]],
     constant uint& count [[buffer(2)]],
     constant uint& op [[buffer(3)]],
+    constant float& alpha [[buffer(4)]],
     uint3 gid [[thread_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint3 group_id [[threadgroup_position_in_grid]],
@@ -182,6 +183,9 @@ kernel void unary(
         case UN_SIGN: res = (v > 0.0f) ? 1.0f : ((v < 0.0f) ? -1.0f : 0.0f); break;
         case UN_IS_NAN: res = isnan(v) ? 1.0f : 0.0f; break;
         case UN_GELU: res = gelu(v); break;
+        case UN_CEIL: res = ceil(v); break;
+        case UN_ROUND: res = rint(v); break;
+        case UN_LEAKY_RELU: res = (v > 0.0f) ? v : alpha * v; break;
     }
     out[i] = res;
 }
@@ -239,6 +243,7 @@ kernel void unaryVec(
     device real* out [[buffer(1)]],
     constant uint& groups [[buffer(2)]],
     constant uint& op [[buffer(3)]],
+    constant float& alpha [[buffer(4)]],
     uint3 gid [[thread_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint3 group_id [[threadgroup_position_in_grid]],
@@ -263,6 +268,9 @@ kernel void unaryVec(
         case UN_COS: res = cos(v); break;
         case UN_LOG: res = log(v); break;
         case UN_GELU: res = 0.5f * v * (1.0f + erfApproxVec(v * M_SQRT1_2_F)); break;
+        case UN_CEIL: res = ceil(v); break;
+        case UN_ROUND: res = rint(v); break;
+        case UN_LEAKY_RELU: res = select(alpha * v, v, v > 0.0f); break;
     }
     VSTOREV(TO_REALV(res), i, out);
 }
