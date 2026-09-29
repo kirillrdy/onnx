@@ -39,6 +39,7 @@ extern fn cuMemAlloc_v2(dptr: *DevicePtr, bytes: usize) Result;
 extern fn cuMemFree_v2(dptr: DevicePtr) Result;
 extern fn cuMemcpyHtoD_v2(dst: DevicePtr, src: *const anyopaque, bytes: usize) Result;
 extern fn cuMemcpyDtoH_v2(dst: *anyopaque, src: DevicePtr, bytes: usize) Result;
+extern fn cuMemcpyDtoD_v2(dst: DevicePtr, src: DevicePtr, bytes: usize) Result;
 extern fn cuLaunchKernel(
     f: CUfunction,
     grid_x: c_uint,
@@ -259,6 +260,12 @@ pub fn Buffer(comptime T: type) type {
             std.debug.assert(host.len <= self.len);
             if (host.len == 0) return;
             try check(cuMemcpyDtoH_v2(host.ptr, self.ptr, host.len * @sizeOf(T)));
+        }
+
+        pub fn copy(self: Self, src: Self) Error!void {
+            std.debug.assert(src.len <= self.len);
+            if (src.len == 0) return;
+            try check(cuMemcpyDtoD_v2(self.ptr, src.ptr, src.len * @sizeOf(T)));
         }
     };
 }

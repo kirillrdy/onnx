@@ -486,5 +486,22 @@ pub fn Buffer(comptime T: type) type {
                 null,
             ));
         }
+
+        pub fn copy(self: Self, src: Self) Error!void {
+            std.debug.assert(src.len <= self.len);
+            if (src.len == 0 or self.ptr == null or src.ptr == null) return;
+            const ctx = self.context orelse global_context orelse return Error.OpenCL;
+            try check(ctx.dispatch.clEnqueueCopyBuffer.?(
+                ctx.queue,
+                @ptrCast(src.ptr),
+                @ptrCast(self.ptr),
+                0,
+                0,
+                src.len * @sizeOf(T),
+                0,
+                null,
+                null,
+            ));
+        }
     };
 }
