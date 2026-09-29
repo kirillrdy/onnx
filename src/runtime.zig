@@ -269,6 +269,7 @@ pub const Session = struct {
             var dequantized = state.dequantized.valueIterator();
             while (dequantized.next()) |buffer| buffer.free();
             state.dequantized.deinit(env.state.allocator);
+            state.dequantized_dims.deinit(env.state.allocator);
             state.graph.deinit();
         }
         try env.state.gpu.makeCurrent();
@@ -300,6 +301,7 @@ pub const Session = struct {
         var dequantized = self.state.dequantized.valueIterator();
         while (dequantized.next()) |buffer| buffer.free();
         self.state.dequantized.deinit(allocator);
+        self.state.dequantized_dims.deinit(allocator);
         var scalars = self.state.scalars.valueIterator();
         while (scalars.next()) |buffer| buffer.free();
         self.state.scalars.deinit(allocator);
@@ -326,6 +328,16 @@ pub const Session = struct {
         outputs: []Value,
     ) !void {
         return self.state.run(input_names, inputs, output_names, outputs);
+    }
+
+    pub fn runDevice(
+        self: Session,
+        input_names: []const [*:0]const u8,
+        inputs: []const Value,
+        output_names: []const [*:0]const u8,
+        outputs: []Value,
+    ) !void {
+        return self.state.runDevice(input_names, inputs, output_names, outputs);
     }
 };
 
@@ -453,6 +465,7 @@ const SessionState = struct {
     column_sums: std.StringHashMapUnmanaged([]const i32) = .empty,
     /// The weights of the fused quantized products, as floats on the device.
     dequantized: std.StringHashMapUnmanaged(driver.Buffer(Element)) = .empty,
+    dequantized_dims: std.StringHashMapUnmanaged([2]i64) = .empty,
     /// One-element device buffers by the float they hold, for the operators
     /// that scale by a constant; see `scalar`.
     scalars: std.AutoHashMapUnmanaged(u32, driver.Buffer(Element)) = .empty,
@@ -479,6 +492,27 @@ const SessionState = struct {
         inputs: []const Value,
         output_names: []const [*:0]const u8,
         outputs: []Value,
+    ) !void {
+        return self.runInner(input_names, inputs, output_names, outputs, false);
+    }
+
+    fn runDevice(
+        self: *SessionState,
+        input_names: []const [*:0]const u8,
+        inputs: []const Value,
+        output_names: []const [*:0]const u8,
+        outputs: []Value,
+    ) !void {
+        return self.runInner(input_names, inputs, output_names, outputs, true);
+    }
+
+    fn runInner(
+        self: *SessionState,
+        input_names: []const [*:0]const u8,
+        inputs: []const Value,
+        output_names: []const [*:0]const u8,
+        outputs: []Value,
+        device_outputs: bool,
     ) !void {
         if (input_names.len != inputs.len or output_names.len != outputs.len) return Error.NativeRuntime;
         // Otherwise a failure with nothing to say about itself reports the
@@ -522,7 +556,9 @@ const SessionState = struct {
 
         for (input_names, inputs) |name_z, value| {
             const tensor = try arena.create(Tensor);
-            if (value.dtype == .f32) {
+            if (value.gpu) |gpu_buffer| {
+                tensor.* = .{ .dtype = .f32, .dims = value.dims, .data = .{ .constant_gpu = gpu_buffer } };
+            } else if (value.dtype == .f32) {
                 const storage = try self.newStorage(value.bytes.len / @sizeOf(f32));
                 try uploadFloats(arena, storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, value.bytes)));
                 tensor.* = .{ .dtype = .f32, .dims = value.dims, .data = .{ .gpu = storage } };
@@ -559,7 +595,10 @@ const SessionState = struct {
         for (output_names, outputs) |name_z, *output| {
             const name = std.mem.span(name_z);
             const tensor = values.get(name) orelse return Error.MissingValue;
-            output.* = try Value.take(self.env.allocator, tensor.*);
+            output.* = if (device_outputs)
+                try Value.takeDevice(self.env.allocator, tensor.*)
+            else
+                try Value.take(self.env.allocator, tensor.*);
             if (uses.getPtr(name)) |remaining| {
                 remaining.* -= 1;
                 if (remaining.* == 0) self.release(tensor);
@@ -667,7 +706,9 @@ const SessionState = struct {
                     plan.arity = 3;
                 } else {
                     const dot = self.graph.nodes[at];
-                    if (!std.mem.eql(u8, dot.op_type, "MatMul") or dot.inputs.len != 2) continue;
+                    const is_matmul = std.mem.eql(u8, dot.op_type, "MatMul") and dot.inputs.len == 2;
+                    const is_matmul_nbits = std.mem.eql(u8, dot.op_type, "MatMulNBits") and dot.inputs.len >= 2;
+                    if (!is_matmul and !is_matmul_nbits) continue;
                     plan = .{
                         .kind = .biased_product,
                         .operands = .{ dot.inputs[0], dot.inputs[1], bias },
@@ -675,8 +716,15 @@ const SessionState = struct {
                     };
                 }
                 // The bias runs along the columns the product writes.
-                const weights = self.graph.constant(plan.operands[1]) orelse continue;
-                if (weights.dims.len == 0 or weights.dims[weights.dims.len - 1] != tensor.dims[0]) continue;
+                const dot_node = self.graph.nodes[at];
+                const width: i64 = if (std.mem.eql(u8, dot_node.op_type, "MatMulNBits"))
+                    dot_node.int("N", 0)
+                else blk: {
+                    const weights = self.graph.constant(plan.operands[1]) orelse continue;
+                    if (weights.dims.len == 0) continue;
+                    break :blk weights.dims[weights.dims.len - 1];
+                };
+                if (width != tensor.dims[0]) continue;
 
                 _ = self.fused.remove(at);
                 try self.fused.put(allocator, index, plan);
@@ -955,21 +1003,59 @@ const SessionState = struct {
         uses: Uses,
         swallowed: *[4]usize,
     ) ?[]const u8 {
-        const half = self.scalarOperand(self.graph.nodes[index], "Mul") orelse return null;
-        if (@abs(half.value - 0.5) > 1e-6) return null;
-        if ((uses.get(half.tensor) orelse 0) != 1) return null;
+        const node = self.graph.nodes[index];
+        if (!std.mem.eql(u8, node.op_type, "Mul") or node.inputs.len != 2) return null;
 
-        const product_at = producer.get(half.tensor) orelse return null;
-        const closing = self.graph.nodes[product_at];
-        if (!std.mem.eql(u8, closing.op_type, "Mul") or closing.inputs.len != 2) return null;
+        // Form 1: Mul(Mul(x, 1 + erf), 0.5)
+        if (self.scalarOperand(node, "Mul")) |half| {
+            if (@abs(half.value - 0.5) <= 1e-6 and (uses.get(half.tensor) orelse 0) == 1) {
+                if (producer.get(half.tensor)) |product_at| {
+                    const closing = self.graph.nodes[product_at];
+                    if (std.mem.eql(u8, closing.op_type, "Mul") and closing.inputs.len == 2) {
+                        for (0..2) |side| {
+                            const shifted = closing.inputs[side];
+                            const source = closing.inputs[1 - side];
+                            if ((uses.get(shifted) orelse 0) != 1) continue;
+                            if ((uses.get(source) orelse 0) != 2) continue;
 
+                            const shift_at = producer.get(shifted) orelse continue;
+                            const one = self.scalarOperand(self.graph.nodes[shift_at], "Add") orelse continue;
+                            if (@abs(one.value - 1.0) > 1e-6) continue;
+                            if ((uses.get(one.tensor) orelse 0) != 1) continue;
+
+                            const erf_at = producer.get(one.tensor) orelse continue;
+                            const erf = self.graph.nodes[erf_at];
+                            if (!std.mem.eql(u8, erf.op_type, "Erf") or erf.inputs.len != 1) continue;
+                            if ((uses.get(erf.inputs[0]) orelse 0) != 1) continue;
+
+                            const scale_at = producer.get(erf.inputs[0]) orelse continue;
+                            const scale = self.graph.nodes[scale_at];
+                            if (!std.mem.eql(u8, scale.op_type, "Div") or scale.inputs.len != 2) continue;
+                            if (!std.mem.eql(u8, scale.inputs[0], source)) continue;
+                            const root = self.scalarConstant(scale.inputs[1]) orelse continue;
+                            if (@abs(root - std.math.sqrt2) > 1e-5) continue;
+
+                            swallowed.* = .{ product_at, shift_at, erf_at, scale_at };
+                            return source;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Form 2: Mul(x, Mul(1 + erf, 0.5))
         for (0..2) |side| {
-            const shifted = closing.inputs[side];
-            const source = closing.inputs[1 - side];
-            if ((uses.get(shifted) orelse 0) != 1) continue;
+            const source = node.inputs[side];
+            const scaled = node.inputs[1 - side];
             if ((uses.get(source) orelse 0) != 2) continue;
+            if ((uses.get(scaled) orelse 0) != 1) continue;
 
-            const shift_at = producer.get(shifted) orelse continue;
+            const scale_at = producer.get(scaled) orelse continue;
+            const half = self.scalarOperand(self.graph.nodes[scale_at], "Mul") orelse continue;
+            if (@abs(half.value - 0.5) > 1e-6) continue;
+            if ((uses.get(half.tensor) orelse 0) != 1) continue;
+
+            const shift_at = producer.get(half.tensor) orelse continue;
             const one = self.scalarOperand(self.graph.nodes[shift_at], "Add") orelse continue;
             if (@abs(one.value - 1.0) > 1e-6) continue;
             if ((uses.get(one.tensor) orelse 0) != 1) continue;
@@ -979,16 +1065,17 @@ const SessionState = struct {
             if (!std.mem.eql(u8, erf.op_type, "Erf") or erf.inputs.len != 1) continue;
             if ((uses.get(erf.inputs[0]) orelse 0) != 1) continue;
 
-            const scale_at = producer.get(erf.inputs[0]) orelse continue;
-            const scale = self.graph.nodes[scale_at];
-            if (!std.mem.eql(u8, scale.op_type, "Div") or scale.inputs.len != 2) continue;
-            if (!std.mem.eql(u8, scale.inputs[0], source)) continue;
-            const root = self.scalarConstant(scale.inputs[1]) orelse continue;
+            const div_at = producer.get(erf.inputs[0]) orelse continue;
+            const div = self.graph.nodes[div_at];
+            if (!std.mem.eql(u8, div.op_type, "Div") or div.inputs.len != 2) continue;
+            if (!std.mem.eql(u8, div.inputs[0], source)) continue;
+            const root = self.scalarConstant(div.inputs[1]) orelse continue;
             if (@abs(root - std.math.sqrt2) > 1e-5) continue;
 
-            swallowed.* = .{ product_at, shift_at, erf_at, scale_at };
+            swallowed.* = .{ scale_at, shift_at, erf_at, div_at };
             return source;
         }
+
         return null;
     }
 
@@ -1218,6 +1305,60 @@ const SessionState = struct {
             try uploadFloats(allocator, buffer, floats);
             try self.dequantized.put(allocator, name, buffer);
         }
+
+        // Dequantize and transpose MatMulNBits weights so they can execute
+        // through the fast Tensor Core GEMM engine.
+        for (self.graph.nodes) |node| {
+            if (!std.mem.eql(u8, node.op_type, "MatMulNBits")) continue;
+            if (node.inputs.len < 3) continue;
+            const weights_name = node.inputs[1];
+            const scales_name = node.inputs[2];
+            if (self.dequantized.contains(weights_name)) continue;
+
+            const depth = node.int("K", 0);
+            const width = node.int("N", 0);
+            const block_size = node.int("block_size", 0);
+            if (depth <= 0 or width <= 0 or block_size < 2) continue;
+            if (!std.math.isPowerOfTwo(@as(u64, @intCast(block_size)))) continue;
+
+            const weights = self.graph.constant(weights_name) orelse continue;
+            const scales_tensor = self.graph.constant(scales_name) orelse continue;
+            if (scales_tensor.dtype != .f32) continue;
+            const scales = scales_tensor.f32s();
+
+            const u_depth: usize = @intCast(depth);
+            const u_width: usize = @intCast(width);
+            const shift: u5 = @intCast(@ctz(@as(u32, @intCast(block_size))));
+            const block_mask = (@as(usize, 1) << shift) - 1;
+            const blob = @as(usize, 1) << (shift - 1);
+            const blocks_per_row = @divFloor(u_depth + @as(usize, @intCast(block_size)) - 1, @as(usize, @intCast(block_size)));
+            const row_stride = blocks_per_row * blob;
+
+            if (weights.data.len < u_width * row_stride) continue;
+            if (scales.len < u_width * blocks_per_row) continue;
+
+            const total_elements = u_depth * u_width;
+            const floats = try allocator.alloc(f32, total_elements);
+            defer allocator.free(floats);
+
+            const quantized = weights.data;
+            for (0..u_width) |n| {
+                for (0..u_depth) |k| {
+                    const block = k >> shift;
+                    const within = k & block_mask;
+                    const byte = quantized[n * row_stride + block * blob + (within >> 1)];
+                    const nibble: u8 = if (within & 1 == 0) byte & 0xf else byte >> 4;
+                    const val = (@as(f32, @floatFromInt(nibble)) - 8.0) * scales[n * blocks_per_row + block];
+                    floats[k * u_width + n] = val;
+                }
+            }
+
+            const buffer = try driver.Buffer(Element).alloc(total_elements);
+            errdefer buffer.free();
+            try uploadFloats(allocator, buffer, floats);
+            try self.dequantized.put(allocator, weights_name, buffer);
+            try self.dequantized_dims.put(allocator, weights_name, .{ depth, width });
+        }
     }
 
     /// A fused quantized product: the float product against the weight
@@ -1355,6 +1496,21 @@ const SessionState = struct {
         name: []const u8,
     ) !*Tensor {
         if (values.get(name)) |tensor| return tensor;
+        if (self.dequantized.get(name)) |buffer| {
+            if (self.dequantized_dims.get(name)) |dims| {
+                const tensor = try arena.create(Tensor);
+                const b_dims = try arena.alloc(i64, 2);
+                b_dims[0] = dims[0];
+                b_dims[1] = dims[1];
+                tensor.* = .{
+                    .dtype = .f32,
+                    .dims = b_dims,
+                    .data = .{ .constant_gpu = buffer },
+                };
+                try values.put(arena, name, tensor);
+                return tensor;
+            }
+        }
         return self.materialize(arena, values, name, self.graph.constant(name) orelse return Error.MissingValue);
     }
 
@@ -3242,6 +3398,12 @@ const SessionState = struct {
     /// ONNX Runtime's MatMulNBits. The weight matrix is 4-bit and transposed,
     /// so it neither goes through `input` nor through the plain matmul.
     fn matmulNBits(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
+        if (self.dequantized.contains(node.inputs[1])) {
+            const a = try self.input(arena, values, node.inputs[0]);
+            if (a.dims.len >= 2) {
+                return self.matmulOf(arena, values, node.inputs[0], node.inputs[1], null, .none, node.outputs[0]);
+            }
+        }
         const a = try self.input(arena, values, node.inputs[0]);
         // Zero points, a group index or a bias would each need their own
         // handling, and none of SAM 3's exports carry them.
@@ -5262,11 +5424,15 @@ pub const Value = struct {
     dtype: onnx.DataType,
     bytes: []const u8,
     dims: []const i64,
+    gpu: ?driver.Buffer(Element) = null,
     owned_allocator: ?std.mem.Allocator = null,
     owned_f32: ?[]f32 = null,
     owned_i64: ?[]i64 = null,
 
     pub fn deinit(self: Value) void {
+        if (self.gpu) |buf| {
+            buf.free();
+        }
         if (self.owned_allocator) |allocator| {
             allocator.free(self.dims);
             if (self.owned_f32) |data| {
@@ -5293,6 +5459,14 @@ pub const Value = struct {
 
     pub fn dataF32(self: Value) ![]const f32 {
         if (self.dtype != .f32) return Error.NativeRuntime;
+        if (self.bytes.len == 0 and self.gpu != null) {
+            const count = try elementCount(self.dims);
+            const allocator = self.owned_allocator orelse return Error.NativeRuntime;
+            const data = try allocator.alloc(f32, count);
+            errdefer allocator.free(data);
+            try self.gpu.?.download(data);
+            return data;
+        }
         return @alignCast(std.mem.bytesAsSlice(f32, self.bytes));
     }
 
@@ -5332,6 +5506,26 @@ pub const Value = struct {
             },
             else => return Error.UnsupportedDataType,
         }
+    }
+
+    fn takeDevice(allocator: std.mem.Allocator, tensor: Tensor) !Value {
+        const dims = try allocator.dupe(i64, tensor.dims);
+        errdefer allocator.free(dims);
+        if (tensor.dtype == .f32 and !tensor.onHost()) {
+            const count = try tensor.count();
+            const src_buf = try tensor.gpuBuffer();
+            const buf = try driver.Buffer(Element).alloc(count);
+            errdefer buf.free();
+            try buf.copy(src_buf);
+            return .{
+                .dtype = .f32,
+                .bytes = &.{},
+                .dims = dims,
+                .gpu = buf,
+                .owned_allocator = allocator,
+            };
+        }
+        return take(allocator, tensor);
     }
 };
 
