@@ -901,7 +901,7 @@ inline fn matmulTiled(
 
 const tc_tile_m = 128;
 const tc_tile_n = 64;
-const tc_bk = 8;
+const tc_bk = 16;
 
 var tc_sa: [2][tc_tile_m][tc_bk]f32 addrspace(.shared) = undefined;
 var tc_sb: [2][tc_bk][tc_tile_n]f32 addrspace(.shared) = undefined;
@@ -916,44 +916,27 @@ inline fn stageTensorA(
     step: u32,
     thread: u32,
 ) void {
-    const r0 = thread / 2;
-    const c0 = (thread % 2) * 4;
-    const r1 = 64 + (thread / 2);
-    const c1 = (thread % 2) * 4;
+    const thread_row = thread / 4;
+    const c = (thread % 4) * 4;
 
-    if (row_base + r0 < m) {
-        const offset0 = a_base + (row_base + r0) * k + step + c0;
-        if (offset0 % 4 == 0 and step + c0 + 4 <= k) {
-            stageGlobalFloat4(&tc_sa[stage][r0][c0], a + offset0);
+    inline for (0..4) |pass| {
+        const r = thread_row + pass * 32;
+        if (row_base + r < m) {
+            const offset = a_base + (row_base + r) * k + step + c;
+            if (offset % 4 == 0 and step + c + 4 <= k) {
+                stageGlobalFloat4(&tc_sa[stage][r][c], a + offset);
+            } else {
+                inline for (0..4) |idx| {
+                    tc_sa[stage][r][c + idx] = if (step + c + idx < k)
+                        a[offset + idx]
+                    else
+                        0;
+                }
+            }
         } else {
             inline for (0..4) |idx| {
-                tc_sa[stage][r0][c0 + idx] = if (step + c0 + idx < k)
-                    a[a_base + (row_base + r0) * k + step + c0 + idx]
-                else
-                    0;
+                tc_sa[stage][r][c + idx] = 0;
             }
-        }
-    } else {
-        inline for (0..4) |idx| {
-            tc_sa[stage][r0][c0 + idx] = 0;
-        }
-    }
-
-    if (row_base + r1 < m) {
-        const offset1 = a_base + (row_base + r1) * k + step + c1;
-        if (offset1 % 4 == 0 and step + c1 + 4 <= k) {
-            stageGlobalFloat4(&tc_sa[stage][r1][c1], a + offset1);
-        } else {
-            inline for (0..4) |idx| {
-                tc_sa[stage][r1][c1 + idx] = if (step + c1 + idx < k)
-                    a[a_base + (row_base + r1) * k + step + c1 + idx]
-                else
-                    0;
-            }
-        }
-    } else {
-        inline for (0..4) |idx| {
-            tc_sa[stage][r1][c1 + idx] = 0;
         }
     }
 }
@@ -969,32 +952,56 @@ inline fn stageTensorB(
     thread: u32,
     comptime transposed: bool,
 ) void {
-    const r = thread / 16;
-    const c = (thread % 16) * 4;
+    const r0 = thread / 16;
+    const c0 = (thread % 16) * 4;
+    const r1 = 8 + r0;
+    const c1 = c0;
 
     if (transposed) {
         inline for (0..4) |idx| {
-            tc_sb[stage][r][c + idx] = if (col_base + c + idx < n and step + r < k)
-                b[b_base + (col_base + c + idx) * k + step + r]
+            tc_sb[stage][r0][c0 + idx] = if (col_base + c0 + idx < n and step + r0 < k)
+                b[b_base + (col_base + c0 + idx) * k + step + r0]
+            else
+                0;
+            tc_sb[stage][r1][c1 + idx] = if (col_base + c1 + idx < n and step + r1 < k)
+                b[b_base + (col_base + c1 + idx) * k + step + r1]
             else
                 0;
         }
     } else {
-        if (step + r < k) {
-            const offset = b_base + (step + r) * n + col_base + c;
-            if (offset % 4 == 0 and col_base + c + 4 <= n) {
-                stageGlobalFloat4(&tc_sb[stage][r][c], b + offset);
+        if (step + r0 < k) {
+            const offset0 = b_base + (step + r0) * n + col_base + c0;
+            if (offset0 % 4 == 0 and col_base + c0 + 4 <= n) {
+                stageGlobalFloat4(&tc_sb[stage][r0][c0], b + offset0);
             } else {
                 inline for (0..4) |idx| {
-                    tc_sb[stage][r][c + idx] = if (col_base + c + idx < n)
-                        b[b_base + (step + r) * n + col_base + c + idx]
+                    tc_sb[stage][r0][c0 + idx] = if (col_base + c0 + idx < n)
+                        b[offset0 + idx]
                     else
                         0;
                 }
             }
         } else {
             inline for (0..4) |idx| {
-                tc_sb[stage][r][c + idx] = 0;
+                tc_sb[stage][r0][c0 + idx] = 0;
+            }
+        }
+
+        if (step + r1 < k) {
+            const offset1 = b_base + (step + r1) * n + col_base + c1;
+            if (offset1 % 4 == 0 and col_base + c1 + 4 <= n) {
+                stageGlobalFloat4(&tc_sb[stage][r1][c1], b + offset1);
+            } else {
+                inline for (0..4) |idx| {
+                    tc_sb[stage][r1][c1 + idx] = if (col_base + c1 + idx < n)
+                        b[offset1 + idx]
+                    else
+                        0;
+                }
+            }
+        } else {
+            inline for (0..4) |idx| {
+                tc_sb[stage][r1][c1 + idx] = 0;
             }
         }
     }
@@ -1087,23 +1094,63 @@ inline fn matmulTensorTiled(
 
         const read_stage = write_stage ^ 1;
 
+        inline for (0..2) |k_step| {
+            const k_off = k_step * 8;
+            var a_reg: [4][4]f32 = undefined;
+            inline for (0..4) |m_blk| {
+                const r0 = wid_m * 64 + m_blk * 16 + group;
+                const r1 = wid_m * 64 + m_blk * 16 + group + 8;
+                const c0 = k_off + thread_in_group * 2;
+                a_reg[m_blk][0] = tc_sa[read_stage][r0][c0 + 0];
+                a_reg[m_blk][1] = tc_sa[read_stage][r1][c0 + 0];
+                a_reg[m_blk][2] = tc_sa[read_stage][r0][c0 + 1];
+                a_reg[m_blk][3] = tc_sa[read_stage][r1][c0 + 1];
+            }
+
+            var b_reg: [4][2]f32 = undefined;
+            inline for (0..4) |n_blk| {
+                const r = k_off + thread_in_group * 2;
+                const col = wid_n * 32 + n_blk * 8 + group;
+                b_reg[n_blk][0] = tc_sb[read_stage][r + 0][col];
+                b_reg[n_blk][1] = tc_sb[read_stage][r + 1][col];
+            }
+
+            inline for (0..4) |m_blk| {
+                inline for (0..4) |n_blk| {
+                    acc[m_blk][n_blk] = gpu.mmaSyncM16N8K8(
+                        a_reg[m_blk],
+                        b_reg[n_blk],
+                        acc[m_blk][n_blk],
+                    );
+                }
+            }
+        }
+
+        stageWait();
+        gpu.syncThreads();
+        write_stage ^= 1;
+    }
+
+    const final_read_stage = write_stage ^ 1;
+    inline for (0..2) |k_step| {
+        const k_off = k_step * 8;
         var a_reg: [4][4]f32 = undefined;
         inline for (0..4) |m_blk| {
             const r0 = wid_m * 64 + m_blk * 16 + group;
             const r1 = wid_m * 64 + m_blk * 16 + group + 8;
-            const c0 = thread_in_group * 2;
-            a_reg[m_blk][0] = tc_sa[read_stage][r0][c0 + 0];
-            a_reg[m_blk][1] = tc_sa[read_stage][r1][c0 + 0];
-            a_reg[m_blk][2] = tc_sa[read_stage][r0][c0 + 1];
-            a_reg[m_blk][3] = tc_sa[read_stage][r1][c0 + 1];
+            const c0 = k_off + thread_in_group * 2;
+            a_reg[m_blk][0] = tc_sa[final_read_stage][r0][c0 + 0];
+            a_reg[m_blk][1] = tc_sa[final_read_stage][r1][c0 + 0];
+            a_reg[m_blk][2] = tc_sa[final_read_stage][r0][c0 + 1];
+            a_reg[m_blk][3] = tc_sa[final_read_stage][r1][c0 + 1];
         }
 
         var b_reg: [4][2]f32 = undefined;
         inline for (0..4) |n_blk| {
-            const r = thread_in_group * 2;
+            const r = k_off + thread_in_group * 2;
             const col = wid_n * 32 + n_blk * 8 + group;
-            b_reg[n_blk][0] = tc_sb[read_stage][r + 0][col];
-            b_reg[n_blk][1] = tc_sb[read_stage][r + 1][col];
+            b_reg[n_blk][0] = tc_sb[final_read_stage][r + 0][col];
+            b_reg[n_blk][1] = tc_sb[final_read_stage][r + 1][col];
         }
 
         inline for (0..4) |m_blk| {
@@ -1114,40 +1161,6 @@ inline fn matmulTensorTiled(
                     acc[m_blk][n_blk],
                 );
             }
-        }
-
-        stageWait();
-        gpu.syncThreads();
-        write_stage ^= 1;
-    }
-
-    const final_read_stage = write_stage ^ 1;
-    var a_reg: [4][4]f32 = undefined;
-    inline for (0..4) |m_blk| {
-        const r0 = wid_m * 64 + m_blk * 16 + group;
-        const r1 = wid_m * 64 + m_blk * 16 + group + 8;
-        const c0 = thread_in_group * 2;
-        a_reg[m_blk][0] = tc_sa[final_read_stage][r0][c0 + 0];
-        a_reg[m_blk][1] = tc_sa[final_read_stage][r1][c0 + 0];
-        a_reg[m_blk][2] = tc_sa[final_read_stage][r0][c0 + 1];
-        a_reg[m_blk][3] = tc_sa[final_read_stage][r1][c0 + 1];
-    }
-
-    var b_reg: [4][2]f32 = undefined;
-    inline for (0..4) |n_blk| {
-        const r = thread_in_group * 2;
-        const col = wid_n * 32 + n_blk * 8 + group;
-        b_reg[n_blk][0] = tc_sb[final_read_stage][r + 0][col];
-        b_reg[n_blk][1] = tc_sb[final_read_stage][r + 1][col];
-    }
-
-    inline for (0..4) |m_blk| {
-        inline for (0..4) |n_blk| {
-            acc[m_blk][n_blk] = gpu.mmaSyncM16N8K8(
-                a_reg[m_blk],
-                b_reg[n_blk],
-                acc[m_blk][n_blk],
-            );
         }
     }
 
