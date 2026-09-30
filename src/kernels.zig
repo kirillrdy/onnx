@@ -212,6 +212,22 @@ fn copy(
     dst[dst_offset + i] = src[src_offset +% offsetOf(i, meta, 0, rank, rank)];
 }
 
+fn copyVec(
+    src: [*]addrspace(.global) const f32,
+    dst: [*]addrspace(.global) f32,
+    meta: Meta,
+    rank: u32,
+    groups: u32,
+    src_offset: u32,
+    dst_offset: u32,
+) callconv(.kernel) void {
+    const i = gpu.globalIndex();
+    if (i >= groups) return;
+    const src_idx = src_offset +% offsetOf(i, meta, 0, rank, rank);
+    const v4 = gpu.loadGlobalFloat4(src + src_idx);
+    gpu.storeGlobalFloat4(dst + dst_offset + i * 4, v4);
+}
+
 fn fill(
     dst: [*]addrspace(.global) f32,
     value: f32,
@@ -1982,7 +1998,7 @@ fn attention(
 }
 
 export fn anchor() usize {
-    return @intFromPtr(&binary) ^ @intFromPtr(&unary) ^ @intFromPtr(&copy) ^
+    return @intFromPtr(&binary) ^ @intFromPtr(&unary) ^ @intFromPtr(&copy) ^ @intFromPtr(&copyVec) ^
         @intFromPtr(&fill) ^ @intFromPtr(&select) ^ @intFromPtr(&tile) ^ @intFromPtr(&conv2dGemm) ^
         @intFromPtr(&matmulNBits) ^ @intFromPtr(&cumulativeSum) ^ @intFromPtr(&maxPool2d) ^ @intFromPtr(&avgPool2d) ^ @intFromPtr(&gridSample) ^
         @intFromPtr(&sumAxes) ^ @intFromPtr(&resizeNearest) ^ @intFromPtr(&instanceNorm) ^
