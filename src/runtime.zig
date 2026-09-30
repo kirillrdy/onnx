@@ -2551,7 +2551,14 @@ const SessionState = struct {
             break :suited kernel;
         };
 
-        const engines: enum { tensor, blocked, xmx, simd, staged } = if (self.env.gpu.matmul_tensor != null)
+        const tensor_suited: ?driver.Function = suited: {
+            const kernel = self.env.gpu.matmul_tensor orelse break :suited null;
+            if (args.k % 16 != 0 or args.n % 8 != 0) break :suited null;
+            if (args.k < 16 or args.n < 16) break :suited null;
+            break :suited kernel;
+        };
+
+        const engines: enum { tensor, blocked, xmx, simd, staged } = if (tensor_suited != null)
             .tensor
         else if (blocked != null)
             .blocked
@@ -2562,7 +2569,7 @@ const SessionState = struct {
         else
             .staged;
         const kernel = switch (engines) {
-            .tensor => self.env.gpu.matmul_tensor.?,
+            .tensor => tensor_suited.?,
             .blocked => blocked.?,
             .xmx => self.env.gpu.matmul_xmx.?,
             .simd => self.env.gpu.matmul_simd.?,
