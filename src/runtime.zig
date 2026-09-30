@@ -5602,7 +5602,7 @@ pub const Value = struct {
             const allocator = self.owned_allocator orelse return Error.NativeRuntime;
             const data = try allocator.alloc(f32, count);
             errdefer allocator.free(data);
-            try self.gpu.?.download(data);
+            try downloadFloats(allocator, self.gpu.?, data);
             return data;
         }
         return @alignCast(std.mem.bytesAsSlice(f32, self.bytes));
