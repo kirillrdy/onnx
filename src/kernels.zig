@@ -1825,9 +1825,9 @@ fn convTranspose2dGemm(
 const attention_rows_per_lane = 8;
 const attention_query_rows = 16 * attention_rows_per_lane;
 
-var q_tile: [attention_query_rows][64]f32 addrspace(.shared) = undefined;
-var k_tile: [64][16]f32 addrspace(.shared) = undefined;
-var v_tile: [16][64]f32 addrspace(.shared) = undefined;
+var q_tile: [attention_query_rows][64]f32 align(16) addrspace(.shared) = undefined;
+var k_tile: [64][16]f32 align(16) addrspace(.shared) = undefined;
+var v_tile: [16][64]f32 align(16) addrspace(.shared) = undefined;
 
 fn attention(
     q: [*]addrspace(.global) const f32,
@@ -1838,7 +1838,7 @@ fn attention(
     keys: u32,
     scale: f32,
 ) callconv(.kernel) void {
-    @setEvalBranchQuota(5000);
+    @setEvalBranchQuota(10000);
     const tx = gpu.threadIndex();
     const ty = gpu.threadIndexY();
     const slot = ty * 16 + tx;
@@ -1850,14 +1850,16 @@ fn attention(
     const v_base = batch * keys * 64;
     const out_base = batch * queries * 64;
 
-    inline for (0..attention_query_rows * 64 / 256) |slab| {
-        const idx = slot + slab * 256;
-        const qr = idx / 64;
-        const qc = idx % 64;
-        q_tile[qr][qc] = if (row_base + qr < queries)
-            q[q_base + (row_base + qr) * 64 + qc]
-        else
-            0.0;
+    inline for (0..8) |iter| {
+        const f4_idx = slot + iter * 256;
+        const qr = f4_idx / 16;
+        const qc = (f4_idx % 16) * 4;
+        if (row_base + qr < queries) {
+            const v4 = gpu.loadGlobalFloat4(q + q_base + (row_base + qr) * 64 + qc);
+            inline for (0..4) |i| q_tile[qr][qc + i] = v4[i];
+        } else {
+            inline for (0..4) |i| q_tile[qr][qc + i] = 0.0;
+        }
     }
 
     var out_acc: [attention_rows_per_lane][4]f32 = @splat(@splat(0.0));
@@ -1869,39 +1871,55 @@ fn attention(
 
     var key_base: u32 = 0;
     while (key_base < keys) : (key_base += 16) {
-        inline for (0..4) |slab| {
-            const idx = slot + slab * 256;
-            const kd = idx / 16;
-            const kk = idx % 16;
-            k_tile[kd][kk] = if (key_base + kk < keys)
-                kt[kt_base + kd * keys + key_base + kk]
-            else
-                0.0;
+        const kd = slot / 4;
+        const kk = (slot % 4) * 4;
+        if (key_base + kk + 4 <= keys) {
+            const v4 = gpu.loadGlobalFloat4(kt + kt_base + kd * keys + key_base + kk);
+            inline for (0..4) |i| k_tile[kd][kk + i] = v4[i];
+        } else {
+            inline for (0..4) |i| {
+                k_tile[kd][kk + i] = if (key_base + kk + i < keys)
+                    kt[kt_base + kd * keys + key_base + kk + i]
+                else
+                    0.0;
+            }
         }
 
-        inline for (0..4) |slab| {
-            const idx = slot + slab * 256;
-            const vk = idx / 64;
-            const vd = idx % 64;
-            v_tile[vk][vd] = if (key_base + vk < keys)
-                v[v_base + (key_base + vk) * 64 + vd]
-            else
-                0.0;
+        const vk = slot / 16;
+        const vd = (slot % 16) * 4;
+        if (key_base + vk < keys) {
+            const v4 = gpu.loadGlobalFloat4(v + v_base + (key_base + vk) * 64 + vd);
+            inline for (0..4) |i| v_tile[vk][vd + i] = v4[i];
+        } else {
+            inline for (0..4) |i| v_tile[vk][vd + i] = 0.0;
         }
         gpu.syncThreads();
 
+        var s: [attention_rows_per_lane]f32 = @splat(0.0);
+        inline for (0..16) |d_chunk| {
+            const d0 = d_chunk * 4;
+            const k0 = k_tile[d0 + 0][tx];
+            const k1 = k_tile[d0 + 1][tx];
+            const k2 = k_tile[d0 + 2][tx];
+            const k3 = k_tile[d0 + 3][tx];
+            inline for (0..attention_rows_per_lane) |qr| {
+                const row = ty + qr * 16;
+                s[qr] = @mulAdd(f32, q_tile[row][d0 + 0], k0, s[qr]);
+                s[qr] = @mulAdd(f32, q_tile[row][d0 + 1], k1, s[qr]);
+                s[qr] = @mulAdd(f32, q_tile[row][d0 + 2], k2, s[qr]);
+                s[qr] = @mulAdd(f32, q_tile[row][d0 + 3], k3, s[qr]);
+            }
+        }
+
+        var p_lane: [attention_rows_per_lane]f32 = undefined;
         inline for (0..attention_rows_per_lane) |qr| {
             const row = ty + qr * 16;
-            var s: f32 = 0.0;
-            inline for (0..64) |d| {
-                s = @mulAdd(f32, q_tile[row][d], k_tile[d][tx], s);
-            }
-            s *= scale;
+            var cur_s = s[qr] * scale;
             if (row_base + row >= queries or key_base + tx >= keys) {
-                s = neg_inf;
+                cur_s = neg_inf;
             }
 
-            var cur_max = s;
+            var cur_max = cur_s;
             cur_max = @max(cur_max, gpu.shuffleXor(cur_max, 1, 32));
             cur_max = @max(cur_max, gpu.shuffleXor(cur_max, 2, 32));
             cur_max = @max(cur_max, gpu.shuffleXor(cur_max, 4, 32));
@@ -1909,7 +1927,7 @@ fn attention(
 
             const new_max = @max(running_max[qr], cur_max);
             const alpha = if (running_max[qr] == neg_inf) 0.0 else exp(running_max[qr] - new_max);
-            const p = if (s == neg_inf) 0.0 else exp(s - new_max);
+            const p = if (cur_s == neg_inf) 0.0 else exp(cur_s - new_max);
 
             var cur_sum = p;
             cur_sum += gpu.shuffleXor(cur_sum, 1, 32);
@@ -1922,11 +1940,20 @@ fn attention(
             inline for (0..4) |i| {
                 out_acc[qr][i] *= alpha;
             }
+            p_lane[qr] = p;
+        }
 
-            inline for (0..16) |k| {
-                const p_val = gpu.shuffleIdx(p, lane_base + @as(u32, k), 32);
+        inline for (0..16) |k| {
+            const v_val: [4]f32 = .{
+                v_tile[k][d_col + 0],
+                v_tile[k][d_col + 1],
+                v_tile[k][d_col + 2],
+                v_tile[k][d_col + 3],
+            };
+            inline for (0..attention_rows_per_lane) |qr| {
+                const p_val = gpu.shuffleIdx(p_lane[qr], lane_base + @as(u32, k), 32);
                 inline for (0..4) |i| {
-                    out_acc[qr][i] = @mulAdd(f32, p_val, v_tile[k][d_col + i], out_acc[qr][i]);
+                    out_acc[qr][i] = @mulAdd(f32, p_val, v_val[i], out_acc[qr][i]);
                 }
             }
         }
@@ -1937,9 +1964,13 @@ fn attention(
         const row = ty + qr * 16;
         if (row_base + row < queries) {
             const inv_sum = if (running_sum[qr] > 0.0) (1.0 / running_sum[qr]) else 0.0;
-            inline for (0..4) |i| {
-                out[out_base + (row_base + row) * 64 + d_col + i] = out_acc[qr][i] * inv_sum;
-            }
+            const res: [4]f32 = .{
+                out_acc[qr][0] * inv_sum,
+                out_acc[qr][1] * inv_sum,
+                out_acc[qr][2] * inv_sum,
+                out_acc[qr][3] * inv_sum,
+            };
+            gpu.storeGlobalFloat4(out + out_base + (row_base + row) * 64 + d_col, res);
         }
     }
 }
