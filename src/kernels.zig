@@ -902,9 +902,11 @@ inline fn matmulTiled(
 const tc_tile_m = 128;
 const tc_tile_n = 64;
 const tc_bk = 16;
+const tc_bk_pad = 20;
+const tc_tile_n_pad = 72;
 
-var tc_sa: [2][tc_tile_m][tc_bk]f32 addrspace(.shared) = undefined;
-var tc_sb: [2][tc_bk][tc_tile_n]f32 addrspace(.shared) = undefined;
+var tc_sa: [2][tc_tile_m][tc_bk_pad]f32 align(16) addrspace(.shared) = undefined;
+var tc_sb: [2][tc_bk][tc_tile_n_pad]f32 align(16) addrspace(.shared) = undefined;
 
 inline fn stageTensorA(
     stage: u32,
@@ -1101,10 +1103,12 @@ inline fn matmulTensorTiled(
                 const r0 = wid_m * 64 + m_blk * 16 + group;
                 const r1 = wid_m * 64 + m_blk * 16 + group + 8;
                 const c0 = k_off + thread_in_group * 2;
-                a_reg[m_blk][0] = tc_sa[read_stage][r0][c0 + 0];
-                a_reg[m_blk][1] = tc_sa[read_stage][r1][c0 + 0];
-                a_reg[m_blk][2] = tc_sa[read_stage][r0][c0 + 1];
-                a_reg[m_blk][3] = tc_sa[read_stage][r1][c0 + 1];
+                const a02 = gpu.loadSharedFloat2(&tc_sa[read_stage][r0][c0]);
+                const a13 = gpu.loadSharedFloat2(&tc_sa[read_stage][r1][c0]);
+                a_reg[m_blk][0] = a02[0];
+                a_reg[m_blk][1] = a13[0];
+                a_reg[m_blk][2] = a02[1];
+                a_reg[m_blk][3] = a13[1];
             }
 
             var b_reg: [4][2]f32 = undefined;
@@ -1139,10 +1143,12 @@ inline fn matmulTensorTiled(
             const r0 = wid_m * 64 + m_blk * 16 + group;
             const r1 = wid_m * 64 + m_blk * 16 + group + 8;
             const c0 = k_off + thread_in_group * 2;
-            a_reg[m_blk][0] = tc_sa[final_read_stage][r0][c0 + 0];
-            a_reg[m_blk][1] = tc_sa[final_read_stage][r1][c0 + 0];
-            a_reg[m_blk][2] = tc_sa[final_read_stage][r0][c0 + 1];
-            a_reg[m_blk][3] = tc_sa[final_read_stage][r1][c0 + 1];
+            const a02 = gpu.loadSharedFloat2(&tc_sa[final_read_stage][r0][c0]);
+            const a13 = gpu.loadSharedFloat2(&tc_sa[final_read_stage][r1][c0]);
+            a_reg[m_blk][0] = a02[0];
+            a_reg[m_blk][1] = a13[0];
+            a_reg[m_blk][2] = a02[1];
+            a_reg[m_blk][3] = a13[1];
         }
 
         var b_reg: [4][2]f32 = undefined;
