@@ -141,5 +141,13 @@ pub fn Buffer(comptime T: type) type {
             if (current_context) |context| try context.synchronize();
             if (host.len != 0) c.sam_metal_buffer_download(@bitCast(self.ptr), host.ptr, host.len * @sizeOf(T));
         }
+
+        pub fn copy(self: Self, src: Self) Error!void {
+            std.debug.assert(src.len <= self.len);
+            if (src.len == 0 or self.ptr.buffer == null or src.ptr.buffer == null) return;
+            const context = current_context orelse return Error.Metal;
+            if (c.sam_metal_buffer_copy(context.ptr, @bitCast(self.ptr), @bitCast(src.ptr), src.len * @sizeOf(T)) == 0)
+                return Error.Metal;
+        }
     };
 }
