@@ -169,3 +169,24 @@ void sam_metal_buffer_download(SamMetalBufferRef buffer, void *destination, size
     id<MTLBuffer> object = (__bridge id<MTLBuffer>)buffer.buffer;
     memcpy(destination, (uint8_t *)object.contents + buffer.offset, bytes);
 }
+
+int sam_metal_buffer_copy(SamMetalContext *context, SamMetalBufferRef destination,
+                         SamMetalBufferRef source, size_t bytes) {
+    if (bytes == 0) return 1;
+    if (!context || !destination.buffer || !source.buffer) {
+        set_error(@"invalid buffer in Metal copy");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLCommandBuffer> command = [context->queue commandBuffer];
+        id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
+        [encoder copyFromBuffer:(__bridge id<MTLBuffer>)source.buffer sourceOffset:source.offset
+                       toBuffer:(__bridge id<MTLBuffer>)destination.buffer destinationOffset:destination.offset
+                           size:bytes];
+        [encoder endEncoding];
+        [command commit];
+        context->last = command;
+        return 1;
+    }
+}
+

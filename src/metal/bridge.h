@@ -42,6 +42,8 @@ void sam_metal_buffer_destroy(void *buffer);
 void sam_metal_buffer_upload(SamMetalBufferRef buffer, const void *source, size_t bytes);
 int sam_metal_buffer_upload_async(SamMetalContext *context, SamMetalBufferRef buffer,
                                   const void *source, size_t bytes);
+int sam_metal_buffer_copy(SamMetalContext *context, SamMetalBufferRef destination,
+                         SamMetalBufferRef source, size_t bytes);
 void sam_metal_buffer_download(SamMetalBufferRef buffer, void *destination, size_t bytes);
 
 const char *sam_metal_last_error(void);
