@@ -54,6 +54,33 @@ pub fn syncThreads() void {
     asm volatile ("bar.sync 0;" ::: .{ .memory = true });
 }
 
+pub inline fn shuffleXor(val: f32, mask: u32, width: u32) f32 {
+    const c: u32 = ((32 - width) << 8) | 0x1f;
+    var result: f32 = undefined;
+    asm (
+        "shfl.sync.bfly.b32 %[res], %[val], %[mask], %[c], 0xffffffff;"
+        : [res] "=f" (result),
+        : [val] "f" (val),
+          [mask] "r" (mask),
+          [c] "r" (c),
+    );
+    return result;
+}
+
+pub inline fn shuffleIdx(val: f32, lane: u32, width: u32) f32 {
+    const c: u32 = ((32 - width) << 8) | 0x1f;
+    var result: f32 = undefined;
+    asm (
+        "shfl.sync.idx.b32 %[res], %[val], %[lane], %[c], 0xffffffff;"
+        : [res] "=f" (result),
+        : [val] "f" (val),
+          [lane] "r" (lane),
+          [c] "r" (c),
+    );
+    return result;
+}
+
+
 pub inline fn loadGlobalFloat4(ptr: [*]addrspace(.global) const f32) [4]f32 {
     var v0: f32 = undefined;
     var v1: f32 = undefined;

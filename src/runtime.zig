@@ -428,7 +428,7 @@ const Fusion = struct {
     /// The operators a fused rotary embedding stands for, in graph order, for
     /// the same reason: shapes that turn out not to suit its kernel run them
     /// after all. Unused by the others.
-    swallowed: [15]u32 = @splat(0),
+    swallowed: [20]u32 = @splat(0),
     swallowed_len: u8 = 0,
 
     const Kind = enum {
@@ -568,8 +568,19 @@ const SessionState = struct {
             try values.put(arena, std.mem.span(name_z), tensor);
         }
 
+        const profile = std.c.getenv("ONNX_PROFILE") != null;
+        var op_times: std.StringHashMapUnmanaged(u64) = .empty;
+        defer if (profile) op_times.deinit(self.env.allocator);
+        var op_counts: std.StringHashMapUnmanaged(u32) = .empty;
+        defer if (profile) op_counts.deinit(self.env.allocator);
+
         for (self.graph.nodes, 0..) |node, node_index| {
             if (self.folded.contains(node_index)) continue;
+            var ts0: std.c.timespec = undefined;
+            if (profile) {
+                self.env.gpu.synchronize() catch {};
+                _ = std.c.clock_gettime(.MONOTONIC, &ts0);
+            }
             self.execute(arena, &values, node, node_index) catch |err| {
                 const detail = if (err == error.Cuda or err == error.OpenCL or err == error.Metal) driver.lastError() else "";
                 setError("node {d} {s} ({s}): {t}{s}{s}", .{
@@ -582,6 +593,25 @@ const SessionState = struct {
                 });
                 return err;
             };
+            if (profile) {
+                self.env.gpu.synchronize() catch {};
+                var ts1: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &ts1);
+                const elapsed: u64 = @intCast(@as(i128, ts1.sec - ts0.sec) * 1_000_000_000 + (ts1.nsec - ts0.nsec));
+                const op_name = if (self.fused.get(node_index)) |f| switch (f.kind) {
+                    .attention => "fused.attention",
+                    .biased_product => "fused.biased_product",
+                    .biased_product_gelu => "fused.biased_product_gelu",
+                    .dequantized_product => "fused.dequantized_product",
+                    .layer_norm => "fused.layer_norm",
+                    .gelu => "fused.gelu",
+                    .rotary => "fused.rotary",
+                } else node.op_type;
+                const entry = op_times.getOrPut(self.env.allocator, op_name) catch unreachable;
+                entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + elapsed else elapsed;
+                const centry = op_counts.getOrPut(self.env.allocator, op_name) catch unreachable;
+                centry.value_ptr.* = if (centry.found_existing) centry.value_ptr.* + 1 else 1;
+            }
             for (self.effectiveInputs(node_index, node)) |name| {
                 if (name.len == 0) continue;
                 const remaining = uses.getPtr(name) orelse continue;
@@ -592,6 +622,18 @@ const SessionState = struct {
 
         try self.env.gpu.synchronize();
         self.env.metadataComplete();
+        if (profile) {
+            std.debug.print("\n=== ONNX OP PROFILE ===\n", .{});
+            var it = op_times.iterator();
+            while (it.next()) |entry| {
+                const count = op_counts.get(entry.key_ptr.*) orelse 0;
+                const total_ms = @as(f64, @floatFromInt(entry.value_ptr.*)) / 1_000_000.0;
+                std.debug.print("{s: <25} | count: {d: >4} | total: {d: >8.2} ms | avg: {d: >6.2} ms\n", .{
+                    entry.key_ptr.*, count, total_ms, total_ms / @as(f64, @floatFromInt(count)),
+                });
+            }
+            std.debug.print("=======================\n\n", .{});
+        }
         for (output_names, outputs) |name_z, *output| {
             const name = std.mem.span(name_z);
             const tensor = values.get(name) orelse return Error.MissingValue;
@@ -772,8 +814,7 @@ const SessionState = struct {
             for (plan.swallowed[0..plan.swallowed_len]) |at| try self.folded.put(allocator, at, {});
         }
 
-        // The rotary embedding, where there is a kernel for it. A CUDA build
-        // has none, and a pattern recorded there would have nothing to run.
+        // The rotary embedding, where there is a kernel for it.
         if (self.env.gpu.rope != null) {
             for (self.graph.nodes, 0..) |_, index| {
                 const plan = self.rotaryAt(index, producer, uses) orelse continue;
@@ -1092,6 +1133,59 @@ const SessionState = struct {
     /// negated. Every intermediate has to be read by exactly one node, or
     /// folding it away would take a value something else still wants; `x`
     /// itself is read twice and stays.
+    fn sliceMatches(self: *SessionState, at: usize, start_val: i64, end_val: i64) bool {
+        const node = self.graph.nodes[at];
+        if (!std.mem.eql(u8, node.op_type, "Slice")) return false;
+        if (node.inputs.len < 3) return false;
+        const starts = self.graph.constant(node.inputs[1]) orelse return false;
+        const ends = self.graph.constant(node.inputs[2]) orelse return false;
+        if (starts.elementCount() != 1 or ends.elementCount() != 1) return false;
+        const s: i64 = switch (starts.dtype) {
+            .i64 => starts.i64s()[0],
+            .i32 => @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, starts.data)))[0],
+            else => return false,
+        };
+        const e: i64 = switch (ends.dtype) {
+            .i64 => ends.i64s()[0],
+            .i32 => @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, ends.data)))[0],
+            else => return false,
+        };
+        if (s != start_val or e != end_val) return false;
+        if (node.inputs.len >= 4 and node.inputs[3].len != 0) {
+            const axes = self.graph.constant(node.inputs[3]) orelse return false;
+            if (axes.elementCount() != 1) return false;
+            const ax: i64 = switch (axes.dtype) {
+                .i64 => axes.i64s()[0],
+                .i32 => @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, axes.data)))[0],
+                else => return false,
+            };
+            if (ax != -1) return false;
+        }
+        if (node.inputs.len >= 5 and node.inputs[4].len != 0) {
+            const steps = self.graph.constant(node.inputs[4]) orelse return false;
+            if (steps.elementCount() != 1) return false;
+            const step_val: i64 = switch (steps.dtype) {
+                .i64 => steps.i64s()[0],
+                .i32 => @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, steps.data)))[0],
+                else => return false,
+            };
+            if (step_val != 1) return false;
+        }
+        return true;
+    }
+
+    /// The rotary embedding:
+    ///
+    ///     Add(Mul(x, cos),
+    ///         Mul(Reshape(Concat(Unsqueeze(Neg(Squeeze(Split(Reshape(x))[1]))),
+    ///                            Unsqueeze(Squeeze(Split(Reshape(x))[0])))),
+    ///             sin))
+    ///
+    /// The reshapes and the split (or two Slices) turn the last axis into pairs, and the
+    /// concatenation puts each pair back with the two swapped and the first
+    /// negated. Every intermediate has to be read by exactly one node, or
+    /// folding it away would take a value something else still wants; `x`
+    /// itself is read twice and stays.
     fn rotaryAt(self: *SessionState, index: usize, producer: Producers, uses: Uses) ?Fusion {
         if (self.fused.contains(index) or self.folded.contains(index)) return null;
         const node = self.graph.nodes[index];
@@ -1132,28 +1226,63 @@ const SessionState = struct {
 
             const second = self.graph.nodes[second_at].inputs[0];
             const first = self.graph.nodes[first_at].inputs[0];
-            const split_at = producer.get(first) orelse continue;
-            if (split_at != (producer.get(second) orelse continue)) continue;
-            const halves = self.graph.nodes[split_at];
-            if (!std.mem.eql(u8, halves.op_type, "Split") or halves.outputs.len != 2) continue;
-            if (halves.int("axis", 0) != -1) continue;
-            // The two halves in the order the turn wants them: the second of
-            // each pair negated in front of the first.
-            if (!std.mem.eql(u8, halves.outputs[0], first) or !std.mem.eql(u8, halves.outputs[1], second)) continue;
 
-            const pairs_at = self.onlyProducer(halves.inputs[0], "Reshape", producer, uses) orelse continue;
-            if (!std.mem.eql(u8, self.graph.nodes[pairs_at].inputs[0], straight.value)) continue;
+            var core_buf: [12]u32 = undefined;
+            var core_len: usize = 0;
 
-            var swallowed: [15]u32 = @splat(0);
-            const core = [_]u32{
-                @intCast(straight_at), @intCast(turned_at),       @intCast(back_at),
-                @intCast(join_at),     @intCast(lift_negated_at), @intCast(lift_at),
-                @intCast(negate_at),   @intCast(second_at),       @intCast(first_at),
-                @intCast(split_at),    @intCast(pairs_at),
-            };
-            @memcpy(swallowed[0..core.len], &core);
-            @memcpy(swallowed[core.len..][0..asked_len], asked[0..asked_len]);
-            const length: u8 = @intCast(core.len + asked_len);
+            const split_at = producer.get(first);
+            if (split_at != null and split_at.? == (producer.get(second) orelse std.math.maxInt(usize))) check_split: {
+                const halves = self.graph.nodes[split_at.?];
+                if (!std.mem.eql(u8, halves.op_type, "Split") or halves.outputs.len != 2) break :check_split;
+                if (halves.int("axis", 0) != -1) break :check_split;
+                if (!std.mem.eql(u8, halves.outputs[0], first) or !std.mem.eql(u8, halves.outputs[1], second)) break :check_split;
+
+                const pairs_at = self.onlyProducer(halves.inputs[0], "Reshape", producer, uses) orelse break :check_split;
+                if (!std.mem.eql(u8, self.graph.nodes[pairs_at].inputs[0], straight.value)) break :check_split;
+
+                const core = [_]u32{
+                    @intCast(straight_at), @intCast(turned_at),       @intCast(back_at),
+                    @intCast(join_at),     @intCast(lift_negated_at), @intCast(lift_at),
+                    @intCast(negate_at),   @intCast(second_at),       @intCast(first_at),
+                    @intCast(split_at.?),  @intCast(pairs_at),
+                };
+                @memcpy(core_buf[0..core.len], &core);
+                core_len = core.len;
+            }
+
+            if (core_len == 0) check_slice: {
+                const slice_first_at = producer.get(first) orelse break :check_slice;
+                const slice_second_at = producer.get(second) orelse break :check_slice;
+                if ((uses.get(first) orelse 0) != 1 or (uses.get(second) orelse 0) != 1) break :check_slice;
+                if (!self.sliceMatches(slice_first_at, 0, 1) or !self.sliceMatches(slice_second_at, 1, 2)) break :check_slice;
+
+                const slice_first = self.graph.nodes[slice_first_at];
+                const slice_second = self.graph.nodes[slice_second_at];
+                if (!std.mem.eql(u8, slice_first.inputs[0], slice_second.inputs[0])) break :check_slice;
+                const pairs_name = slice_first.inputs[0];
+                if ((uses.get(pairs_name) orelse 0) != 2) break :check_slice;
+
+                const pairs_at = producer.get(pairs_name) orelse break :check_slice;
+                const pairs_node = self.graph.nodes[pairs_at];
+                if (!std.mem.eql(u8, pairs_node.op_type, "Reshape") or
+                    !std.mem.eql(u8, pairs_node.inputs[0], straight.value)) break :check_slice;
+
+                const core = [_]u32{
+                    @intCast(straight_at),     @intCast(turned_at),       @intCast(back_at),
+                    @intCast(join_at),         @intCast(lift_negated_at), @intCast(lift_at),
+                    @intCast(negate_at),       @intCast(second_at),       @intCast(first_at),
+                    @intCast(slice_first_at),  @intCast(slice_second_at), @intCast(pairs_at),
+                };
+                @memcpy(core_buf[0..core.len], &core);
+                core_len = core.len;
+            }
+
+            if (core_len == 0) continue;
+
+            var swallowed: [20]u32 = @splat(0);
+            @memcpy(swallowed[0..core_len], core_buf[0..core_len]);
+            @memcpy(swallowed[core_len..][0..asked_len], asked[0..asked_len]);
+            const length: u8 = @intCast(core_len + asked_len);
             for (swallowed[0..length]) |at| {
                 if (self.fused.contains(at) or self.folded.contains(at)) return null;
             }
@@ -2562,6 +2691,8 @@ const SessionState = struct {
                 try self.reshape(arena, values, step);
             } else if (std.mem.eql(u8, step.op_type, "Split")) {
                 try self.split(arena, values, step);
+            } else if (std.mem.eql(u8, step.op_type, "Slice")) {
+                try self.slice(arena, values, step);
             } else if (std.mem.eql(u8, step.op_type, "Squeeze")) {
                 try self.squeeze(arena, values, step);
             } else if (std.mem.eql(u8, step.op_type, "Unsqueeze")) {
