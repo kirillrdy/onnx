@@ -241,6 +241,48 @@ fn select(
         b[offsetOf(i, meta, 0, 3 * rank, rank)];
 }
 
+/// The rotary embedding these exports spell out with eleven operators, five of
+/// which write the whole tensor down. Here it is one pass over x.
+fn rope(
+    x: [*]addrspace(.global) const f32,
+    cosine: [*]addrspace(.global) const f32,
+    sine: [*]addrspace(.global) const f32,
+    out: [*]addrspace(.global) f32,
+    count: u32,
+    period: u32,
+    scale: f32,
+) callconv(.kernel) void {
+    const i = gpu.globalIndex();
+    if (i >= count) return;
+    const table = wrap(i, period);
+    const turned = if ((i & 1) != 0) x[i - 1] else -x[i + 1];
+    const value = x[i] * cosine[table] + turned * sine[table];
+    out[i] = value * scale;
+}
+
+fn ropeVec(
+    x: [*]addrspace(.global) const f32,
+    cosine: [*]addrspace(.global) const f32,
+    sine: [*]addrspace(.global) const f32,
+    out: [*]addrspace(.global) f32,
+    groups: u32,
+    table_groups: u32,
+    scale: f32,
+) callconv(.kernel) void {
+    const i = gpu.globalIndex();
+    if (i >= groups) return;
+    const table = if (table_groups != 0) wrap(i, table_groups) else 0;
+    const v = gpu.loadGlobalFloat4(x + i * 4);
+    const turned = [4]f32{ -v[1], v[0], -v[3], v[2] };
+    const c = if (table_groups != 0) gpu.loadGlobalFloat4(cosine + table * 4) else @as([4]f32, @splat(cosine[0]));
+    const s = if (table_groups != 0) gpu.loadGlobalFloat4(sine + table * 4) else @as([4]f32, @splat(sine[0]));
+    var res: [4]f32 = undefined;
+    inline for (0..4) |idx| {
+        res[idx] = (v[idx] * c[idx] + turned[idx] * s[idx]) * scale;
+    }
+    gpu.storeGlobalFloat4(out + i * 4, res);
+}
+
 /// Repeats `src` a whole number of times along every axis. Unlike a broadcast
 /// this wraps the coordinate rather than pinning it, so it cannot be spelled
 /// as a stride of zero.
@@ -1773,7 +1815,6 @@ const attention_query_rows = 16 * attention_rows_per_lane;
 var q_tile: [attention_query_rows][64]f32 addrspace(.shared) = undefined;
 var k_tile: [64][16]f32 addrspace(.shared) = undefined;
 var v_tile: [16][64]f32 addrspace(.shared) = undefined;
-var scores_tile: [attention_query_rows][16]f32 addrspace(.shared) = undefined;
 
 fn attention(
     q: [*]addrspace(.global) const f32,
@@ -1810,6 +1851,9 @@ fn attention(
     var running_max: [attention_rows_per_lane]f32 = @splat(neg_inf);
     var running_sum: [attention_rows_per_lane]f32 = @splat(0.0);
 
+    const lane_base: u32 = (ty & 1) * 16;
+    const d_col = tx * 4;
+
     var key_base: u32 = 0;
     while (key_base < keys) : (key_base += 16) {
         inline for (0..4) |slab| {
@@ -1843,39 +1887,31 @@ fn attention(
             if (row_base + row >= queries or key_base + tx >= keys) {
                 s = neg_inf;
             }
-            scores_tile[row][tx] = s;
-        }
-        gpu.syncThreads();
 
-        var new_max: [attention_rows_per_lane]f32 = undefined;
-        var alpha: [attention_rows_per_lane]f32 = undefined;
-        inline for (0..attention_rows_per_lane) |qr| {
-            const row = ty + qr * 16;
-            var cur_max: f32 = neg_inf;
-            inline for (0..16) |k| {
-                cur_max = @max(cur_max, scores_tile[row][k]);
-            }
-            new_max[qr] = @max(running_max[qr], cur_max);
-            alpha[qr] = if (running_max[qr] == neg_inf) 0.0 else exp(running_max[qr] - new_max[qr]);
-            const score_val = scores_tile[row][tx];
-            scores_tile[row][tx] = if (score_val == neg_inf) 0.0 else exp(score_val - new_max[qr]);
-        }
-        gpu.syncThreads();
+            var cur_max = s;
+            cur_max = @max(cur_max, gpu.shuffleXor(cur_max, 1, 32));
+            cur_max = @max(cur_max, gpu.shuffleXor(cur_max, 2, 32));
+            cur_max = @max(cur_max, gpu.shuffleXor(cur_max, 4, 32));
+            cur_max = @max(cur_max, gpu.shuffleXor(cur_max, 8, 32));
 
-        const d_col = tx * 4;
-        inline for (0..attention_rows_per_lane) |qr| {
-            const row = ty + qr * 16;
-            var cur_sum: f32 = 0.0;
-            inline for (0..16) |k| {
-                cur_sum += scores_tile[row][k];
-            }
-            running_sum[qr] = running_sum[qr] * alpha[qr] + cur_sum;
-            running_max[qr] = new_max[qr];
+            const new_max = @max(running_max[qr], cur_max);
+            const alpha = if (running_max[qr] == neg_inf) 0.0 else exp(running_max[qr] - new_max);
+            const p = if (s == neg_inf) 0.0 else exp(s - new_max);
+
+            var cur_sum = p;
+            cur_sum += gpu.shuffleXor(cur_sum, 1, 32);
+            cur_sum += gpu.shuffleXor(cur_sum, 2, 32);
+            cur_sum += gpu.shuffleXor(cur_sum, 4, 32);
+            cur_sum += gpu.shuffleXor(cur_sum, 8, 32);
+
+            running_sum[qr] = running_sum[qr] * alpha + cur_sum;
+            running_max[qr] = new_max;
             inline for (0..4) |i| {
-                out_acc[qr][i] *= alpha[qr];
+                out_acc[qr][i] *= alpha;
             }
+
             inline for (0..16) |k| {
-                const p_val = scores_tile[row][k];
+                const p_val = gpu.shuffleIdx(p, lane_base + @as(u32, k), 32);
                 inline for (0..4) |i| {
                     out_acc[qr][i] = @mulAdd(f32, p_val, v_tile[k][d_col + i], out_acc[qr][i]);
                 }
@@ -1884,7 +1920,6 @@ fn attention(
         gpu.syncThreads();
     }
 
-    const d_col = tx * 4;
     inline for (0..attention_rows_per_lane) |qr| {
         const row = ty + qr * 16;
         if (row_base + row < queries) {
@@ -1907,5 +1942,6 @@ export fn anchor() usize {
         @intFromPtr(&softmax) ^ @intFromPtr(&matmul) ^
         (if (ptx_options.ampere_or_newer) @intFromPtr(&matmulTensor) else 0) ^
         @intFromPtr(&matmulPost) ^ @intFromPtr(&conv2d) ^
-        @intFromPtr(&convTranspose2d) ^ @intFromPtr(&convTranspose2dGemm) ^ @intFromPtr(&attention);
+        @intFromPtr(&convTranspose2d) ^ @intFromPtr(&convTranspose2dGemm) ^
+        @intFromPtr(&rope) ^ @intFromPtr(&ropeVec) ^ @intFromPtr(&attention);
 }
