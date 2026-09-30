@@ -144,6 +144,18 @@ pub inline fn loadSharedFloat4(ptr: *addrspace(.shared) const f32) [4]f32 {
     return .{ v0, v1, v2, v3 };
 }
 
+pub inline fn loadSharedFloat2(ptr: *addrspace(.shared) const f32) [2]f32 {
+    var v0: f32 = undefined;
+    var v1: f32 = undefined;
+    asm volatile (
+        "ld.shared.v2.f32 {%[v0], %[v1]}, [%[sptr]];"
+        : [v0] "=f" (v0),
+          [v1] "=f" (v1),
+        : [sptr] "r" (@as(u32, @truncate(@intFromPtr(ptr)))),
+    );
+    return .{ v0, v1 };
+}
+
 pub inline fn mmaSyncM16N8K8(
     a: [4]f32,
     b: [2]f32,
