@@ -59,19 +59,17 @@ pub fn addPtx(b: *std.Build, gpu_source: std.Build.LazyPath, options: PtxOptions
 
     const cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build-obj" });
     cmd.addArgs(&.{
-        "-target",          "nvptx64-cuda",
-        b.fmt("-mcpu={s}", .{mcpu}),
-        "-O",               @tagName(optimize),
-        "-fno-emit-bin",    "-fstrip",
-        "--dep",            "gpu",
-        "--dep",            "ptx_options",
+        "-target",                   "nvptx64-cuda",
+        b.fmt("-mcpu={s}", .{mcpu}), "-O",
+        @tagName(optimize),          "-fno-emit-bin",
+        "-fstrip",                   "--dep",
+        "gpu",                       "--dep",
+        "ptx_options",
     });
     cmd.addPrefixedFileArg("-Mroot=", options.root_source_file);
     cmd.addArgs(&.{ "--dep", "ptx_options" });
     cmd.addPrefixedFileArg("-Mgpu=", gpu_source);
     cmd.addPrefixedFileArg("-Mptx_options=", ptx_options.getOutput());
-    if (b.cache_root.path) |path| cmd.addArgs(&.{ "--cache-dir", path });
-    if (b.graph.global_cache_root.path) |path| cmd.addArgs(&.{ "--global-cache-dir", path });
     return cmd.addPrefixedOutputFileArg("-femit-asm=", "kernels.ptx");
 }
 
@@ -145,6 +143,12 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             });
             driver_mod.addIncludePath(b.path("src/metal"));
+            const bindings = b.addTranslateC(.{
+                .root_source_file = b.path("src/metal/bridge.h"),
+                .target = target,
+                .optimize = optimize,
+            });
+            driver_mod.addImport("c", bindings.createModule());
             driver_mod.addCSourceFile(.{ .file = b.path("src/metal/bridge.m"), .flags = &.{"-fobjc-arc"} });
             driver_mod.link_libc = true;
             driver_mod.linkSystemLibrary("objc", .{});

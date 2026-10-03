@@ -6,7 +6,7 @@ const std = @import("std");
 pub const is_metal = true;
 pub const Error = error{Metal};
 
-const c = @cImport(@cInclude("bridge.h"));
+const c = @import("c");
 
 pub const DevicePtr = extern struct {
     buffer: ?*anyopaque,
