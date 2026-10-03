@@ -99,9 +99,7 @@ pub const Dispatch = extern struct {
     clEnqueueNDRangeKernel: ?*const fn (cl_command_queue, cl_kernel, cl_uint, ?[*]const usize, [*]const usize, ?[*]const usize, cl_uint, ?[*]const ?*anyopaque, ?*?*anyopaque) callconv(.c) cl_int,
 };
 
-const c = @cImport({
-    @cInclude("dlfcn.h");
-});
+const c = std.c;
 
 var global_dispatch: ?*const Dispatch = null;
 var global_platform: cl_platform_id = null;
@@ -147,7 +145,7 @@ pub fn init() Error!void {
         if (path.len >= zpath.len) continue;
         @memcpy(zpath[0..path.len], path);
         zpath[path.len] = 0;
-        handle = c.dlopen(&zpath, c.RTLD_NOW | c.RTLD_GLOBAL);
+        handle = c.dlopen(&zpath, .{ .NOW = true, .GLOBAL = true });
         if (handle != null) break;
     }
 
