@@ -157,7 +157,12 @@ pub const Module = struct {
     /// Looks a kernel up by its Zig name, e.g. "vecAdd".
     pub fn function(self: Module, name: []const u8) Error!Function {
         var buf: [256]u8 = undefined;
-        const symbol = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ self.prefix, name }) catch return Error.Cuda;
+        if (self.prefix.len >= buf.len or name.len >= buf.len - self.prefix.len) return Error.Cuda;
+        const symbol_len = self.prefix.len + name.len;
+        @memcpy(buf[0..self.prefix.len], self.prefix);
+        @memcpy(buf[self.prefix.len..symbol_len], name);
+        buf[symbol_len] = 0;
+        const symbol = buf[0..symbol_len :0];
         var ptr: CUfunction = undefined;
         try check(cuModuleGetFunction(&ptr, self.ptr, symbol.ptr));
         return .{ .ptr = ptr };
@@ -188,16 +193,16 @@ pub const Function = struct {
         if (grid.x == 0 or grid.y == 0 or grid.z == 0) return;
         if (block.x == 0 or block.y == 0 or block.z == 0) return;
 
-        const fields = @typeInfo(@TypeOf(args)).@"struct".fields;
-        comptime var types: [fields.len]type = undefined;
-        inline for (fields, 0..) |field, i| types[i] = field.type;
+        const field_names = comptime std.meta.fieldNames(@TypeOf(args));
+        comptime var types: [field_names.len]type = undefined;
+        inline for (field_names, 0..) |name, i| types[i] = @TypeOf(@field(args, name));
 
         // The driver wants an array of pointers to the argument values, so the
         // values need runtime storage even when the caller passed literals.
-        var values: std.meta.Tuple(&types) = args;
-        var params: [fields.len]?*anyopaque = undefined;
-        inline for (fields, 0..) |field, i| {
-            params[i] = @ptrCast(&@field(values, field.name));
+        var values: @Tuple(&types) = args;
+        var params: [field_names.len]?*anyopaque = undefined;
+        inline for (field_names, 0..) |name, i| {
+            params[i] = @ptrCast(&@field(values, name));
         }
 
         try check(cuLaunchKernel(
@@ -210,7 +215,7 @@ pub const Function = struct {
             block.z,
             0,
             null,
-            if (fields.len == 0) null else &params,
+            if (field_names.len == 0) null else &params,
             null,
         ));
     }

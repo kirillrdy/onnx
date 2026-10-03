@@ -162,7 +162,7 @@ pub fn init() Error!void {
     var dispatch_ptr: *const Dispatch = undefined;
 
     if (clIcdGetPlatformIDsKHR_sym != null) {
-        const clIcdGetPlatformIDsKHR: *const fn (cl_uint, ?[*]cl_platform_id, ?*cl_uint) callconv(.c) cl_int = @ptrCast(clIcdGetPlatformIDsKHR_sym);
+        const clIcdGetPlatformIDsKHR: *const fn (cl_uint, ?[*]cl_platform_id, ?*cl_uint) callconv(.c) cl_int = @ptrCast(@alignCast(clIcdGetPlatformIDsKHR_sym));
         var num_platforms: cl_uint = 0;
         _ = clIcdGetPlatformIDsKHR(0, null, &num_platforms);
         if (num_platforms == 0) {
@@ -175,7 +175,7 @@ pub fn init() Error!void {
         const raw_ptr: *const *const Dispatch = @ptrCast(@alignCast(plat.?));
         dispatch_ptr = raw_ptr.*;
     } else if (clGetPlatformIDs_sym != null) {
-        const clGetPlatformIDs: *const fn (cl_uint, ?[*]cl_platform_id, ?*cl_uint) callconv(.c) cl_int = @ptrCast(clGetPlatformIDs_sym);
+        const clGetPlatformIDs: *const fn (cl_uint, ?[*]cl_platform_id, ?*cl_uint) callconv(.c) cl_int = @ptrCast(@alignCast(clGetPlatformIDs_sym));
         var num_platforms: cl_uint = 0;
         _ = clGetPlatformIDs(0, null, &num_platforms);
         if (num_platforms == 0) {
@@ -332,11 +332,11 @@ pub const Function = struct {
         if (block.x == 0 or block.y == 0 or block.z == 0) return;
 
         const dispatch = self.context.dispatch;
-        const fields = @typeInfo(@TypeOf(args)).@"struct".fields;
+        const field_names = comptime std.meta.fieldNames(@TypeOf(args));
 
-        inline for (fields, 0..) |field, i| {
-            const val = @field(args, field.name);
-            const T = field.type;
+        inline for (field_names, 0..) |name, i| {
+            const val = @field(args, name);
+            const T = @TypeOf(@field(args, name));
             if (T == DevicePtr or T == cl_mem or T == ?*anyopaque or @typeInfo(T) == .pointer or @typeInfo(T) == .optional) {
                 var mem_val: cl_mem = @ptrCast(val);
                 try check(dispatch.clSetKernelArg.?(self.kernel, @intCast(i), @sizeOf(cl_mem), @ptrCast(&mem_val)));
@@ -416,7 +416,7 @@ pub fn Buffer(comptime T: type) type {
             const byte_size = len * @sizeOf(T);
             const region = extern struct { origin: usize, size: usize }{ .origin = byte_offset, .size = byte_size };
             if (byte_offset % 128 == 0 and global_driver_handle != null) {
-                const clCreateSubBuffer_fn: ?*const fn (cl_mem, cl_mem_flags, cl_uint, *const anyopaque, ?*cl_int) callconv(.c) cl_mem = @ptrCast(c.dlsym(global_driver_handle.?, "clCreateSubBuffer"));
+                const clCreateSubBuffer_fn: ?*const fn (cl_mem, cl_mem_flags, cl_uint, *const anyopaque, ?*cl_int) callconv(.c) cl_mem = @ptrCast(@alignCast(c.dlsym(global_driver_handle.?, "clCreateSubBuffer")));
                 if (clCreateSubBuffer_fn) |create_sub| {
                     var status: cl_int = 0;
                     const sub = create_sub(@ptrCast(self.ptr), CL_MEM_READ_WRITE, 0x4200, &region, &status);

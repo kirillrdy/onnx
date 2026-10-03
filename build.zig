@@ -49,10 +49,9 @@ pub fn addPtx(b: *std.Build, gpu_source: std.Build.LazyPath, options: PtxOptions
     // Device code is a separate compilation: a different target, no libc, no
     // std. The NVPTX backend has no object writer, so the artifact is the
     // assembly it prints -- which for NVPTX is PTX, what the driver JITs.
-    const mcpu = if (std.mem.indexOfScalar(u8, options.arch, '+') == null)
-        b.fmt("{s}+ptx70", .{options.arch})
-    else
-        options.arch;
+    // LLVM chooses a PTX version compatible with the GPU. Explicit +ptxNN
+    // features supplied by the caller are still honored.
+    const mcpu = options.arch;
 
     const ptx_options = b.addOptions();
     ptx_options.addOption(bool, "ampere_or_newer", cudaArchAtLeast(options.arch, 80));

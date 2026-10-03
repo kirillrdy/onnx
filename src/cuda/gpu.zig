@@ -230,6 +230,9 @@ pub const panic = struct {
     pub fn invalidErrorCode() noreturn {
         @trap();
     }
+    pub fn unexpectedErrorCode(_: anyerror) noreturn {
+        @trap();
+    }
     pub fn integerOutOfBounds() noreturn {
         @trap();
     }
@@ -270,6 +273,9 @@ pub const panic = struct {
         @trap();
     }
     pub fn noreturnReturned() noreturn {
+        @trap();
+    }
+    pub fn loadUninstantiableType() noreturn {
         @trap();
     }
 };
