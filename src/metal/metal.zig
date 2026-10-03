@@ -73,16 +73,16 @@ pub const Function = struct {
     pub fn launch(self: Function, grid: Dim, block: Dim, args: anytype) Error!void {
         if (grid.x == 0 or grid.y == 0 or grid.z == 0) return;
         if (block.x == 0 or block.y == 0 or block.z == 0) return;
-        const fields = @typeInfo(@TypeOf(args)).@"struct".fields;
-        comptime var types: [fields.len]type = undefined;
-        inline for (fields, 0..) |field, i| types[i] = field.type;
-        var values: std.meta.Tuple(&types) = args;
-        var encoded_args: [fields.len]c.SamMetalArg = undefined;
-        inline for (fields, 0..) |field, i| {
-            if (field.type == DevicePtr) {
-                encoded_args[i] = .{ .kind = c.SAM_METAL_BUFFER, .buffer = @bitCast(@field(values, field.name)), .bytes = null, .size = 0 };
+        const field_names = comptime std.meta.fieldNames(@TypeOf(args));
+        comptime var types: [field_names.len]type = undefined;
+        inline for (field_names, 0..) |name, i| types[i] = @TypeOf(@field(args, name));
+        var values: @Tuple(&types) = args;
+        var encoded_args: [field_names.len]c.SamMetalArg = undefined;
+        inline for (field_names, 0..) |name, i| {
+            if (@TypeOf(@field(args, name)) == DevicePtr) {
+                encoded_args[i] = .{ .kind = c.SAM_METAL_BUFFER, .buffer = bufferRef(@field(values, name)), .bytes = null, .size = 0 };
             } else {
-                encoded_args[i] = .{ .kind = c.SAM_METAL_BYTES, .buffer = @bitCast(null_ptr), .bytes = &@field(values, field.name), .size = @sizeOf(field.type) };
+                encoded_args[i] = .{ .kind = c.SAM_METAL_BYTES, .buffer = bufferRef(null_ptr), .bytes = &@field(values, name), .size = @sizeOf(@TypeOf(@field(args, name))) };
             }
         }
         const metal_grid: c.SamMetalDim = .{ .x = grid.x, .y = grid.y, .z = grid.z };
@@ -127,27 +127,32 @@ pub fn Buffer(comptime T: type) type {
                 .buffer = self.ptr.buffer,
                 .offset = self.ptr.offset + offset * @sizeOf(T),
             };
-            c.sam_metal_buffer_upload(@bitCast(destination), host.ptr, host.len * @sizeOf(T));
+            c.sam_metal_buffer_upload(bufferRef(destination), host.ptr, host.len * @sizeOf(T));
         }
         pub fn uploadAsync(self: Self, host: []const T) Error!void {
             std.debug.assert(host.len <= self.len);
             if (host.len == 0) return;
             const context = current_context orelse return Error.Metal;
-            if (c.sam_metal_buffer_upload_async(context.ptr, @bitCast(self.ptr), host.ptr, host.len * @sizeOf(T)) == 0)
+            if (c.sam_metal_buffer_upload_async(context.ptr, bufferRef(self.ptr), host.ptr, host.len * @sizeOf(T)) == 0)
                 return Error.Metal;
         }
         pub fn download(self: Self, host: []T) Error!void {
             std.debug.assert(host.len <= self.len);
             if (current_context) |context| try context.synchronize();
-            if (host.len != 0) c.sam_metal_buffer_download(@bitCast(self.ptr), host.ptr, host.len * @sizeOf(T));
+            if (host.len != 0) c.sam_metal_buffer_download(bufferRef(self.ptr), host.ptr, host.len * @sizeOf(T));
         }
 
         pub fn copy(self: Self, src: Self) Error!void {
             std.debug.assert(src.len <= self.len);
             if (src.len == 0 or self.ptr.buffer == null or src.ptr.buffer == null) return;
             const context = current_context orelse return Error.Metal;
-            if (c.sam_metal_buffer_copy(context.ptr, @bitCast(self.ptr), @bitCast(src.ptr), src.len * @sizeOf(T)) == 0)
+            if (c.sam_metal_buffer_copy(context.ptr, bufferRef(self.ptr), bufferRef(src.ptr), src.len * @sizeOf(T)) == 0)
                 return Error.Metal;
         }
     };
+}
+
+// Convert the shared ABI fields explicitly: Zig 0.17 disallows extern-struct bitcasts.
+fn bufferRef(ptr: DevicePtr) c.SamMetalBufferRef {
+    return .{ .buffer = ptr.buffer, .offset = ptr.offset };
 }

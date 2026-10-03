@@ -5667,8 +5667,11 @@ pub const Value = struct {
     }
 };
 
-test {
+test "compile the runtime API and GPU execution paths" {
     std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(Env);
+    std.testing.refAllDecls(Session);
+    std.testing.refAllDecls(Value);
 }
 
 test "INT8 DynamicQuantizeLinear and MatMulInteger math" {
