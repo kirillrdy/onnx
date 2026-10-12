@@ -2903,21 +2903,53 @@ const SessionState = struct {
 
     fn softmax(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
         const x = try self.input(arena, values, node.inputs[0]);
-        const axis = normalizeAxis(node.int("axis", -1), x.dims.len);
-        if (x.dtype != .f32 or axis + 1 != x.dims.len) return Error.UnsupportedOperator;
+        const raw_axis = node.int("axis", -1);
+        const rank: i64 = @intCast(x.dims.len);
+        if (raw_axis < -rank or raw_axis >= rank) return Error.InvalidShape;
+        const axis = normalizeAxis(raw_axis, x.dims.len);
+        if (x.dtype != .f32) return Error.UnsupportedOperator;
+        if (x.dims.len > max_rank) return Error.RankTooLarge;
+        if (axis >= x.dims.len) return Error.InvalidShape;
         const cols: usize = @intCast(x.dims[axis]);
+        if (cols == 0) return Error.InvalidShape;
         const count = try x.count();
         const rows = count / cols;
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
         const xb = try x.gpuBuffer();
+        // Move the reduction axis to the end for the row-wise kernel, then
+        // restore the original layout. YOLO's DFL head reduces axis 1.
+        const inner = try elementCount(x.dims[axis + 1 ..]);
+        const outer = try elementCount(x.dims[0..axis]);
+        const packed_rows = if (inner != 1) try self.newStorage(count) else null;
+        defer if (packed_rows) |buffer| self.releaseStorage(buffer);
+        const reduced = if (inner != 1) try self.newStorage(count) else null;
+        defer if (reduced) |buffer| self.releaseStorage(buffer);
+        if (packed_rows) |buffer| {
+            var metadata = [_]u32{
+                @intCast(outer),        @intCast(inner), @intCast(cols),
+                @intCast(cols * inner), 1,               @intCast(inner),
+            };
+            try self.strided(xb.ptr, buffer.buffer.ptr, &metadata, count, 0, 0);
+        }
         // A power of two, since the fallback tree reduction halves it, and
         // capped well below the hardware maximum: a row is reduced twice, and a
         // wide block spends more on the reduction than on the row, while a
         // narrow one just loops over more of the row.
         var block: u32 = 32;
         while (block < cols and block < 256) block *= 2;
-        try self.env.gpu.softmax.launch(.{ .x = @intCast(rows) }, .{ .x = block }, .{ xb.ptr, storage.buffer.ptr, @as(u32, @intCast(cols)) });
+        try self.env.gpu.softmax.launch(.{ .x = @intCast(rows) }, .{ .x = block }, .{
+            if (packed_rows) |buffer| buffer.buffer.ptr else xb.ptr,
+            if (reduced) |buffer| buffer.buffer.ptr else storage.buffer.ptr,
+            @as(u32, @intCast(cols)),
+        });
+        if (reduced) |buffer| {
+            var metadata = [_]u32{
+                @intCast(outer),        @intCast(cols), @intCast(inner),
+                @intCast(inner * cols), 1,              @intCast(cols),
+            };
+            try self.strided(buffer.buffer.ptr, storage.buffer.ptr, &metadata, count, 0, 0);
+        }
         const dims = try arena.dupe(i64, x.dims);
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
@@ -5672,6 +5704,57 @@ test "compile the runtime API and GPU execution paths" {
     std.testing.refAllDecls(Env);
     std.testing.refAllDecls(Session);
     std.testing.refAllDecls(Value);
+}
+
+test "GPU Softmax matches the reference across tensor axes and repeated runs" {
+    const allocator = std.testing.allocator;
+    const env = try Env.init(allocator, std.testing.io);
+    defer env.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var session = SessionState{ .env = env.state, .graph = undefined, .arena = arena };
+    const shapes = [_][3]i64{ .{ 2, 3, 4 }, .{ 2, 3, 1 } };
+    for (shapes) |shape| {
+        const count = try elementCount(&shape);
+        var input: [24]f32 = undefined;
+        for (input[0..count], 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 7)) - 3;
+        const source = try session.newStorage(count);
+        defer session.releaseStorage(source);
+        try uploadFloats(arena, source.buffer, input[0..count]);
+        var tensor = Tensor{ .dtype = .f32, .dims = &shape, .data = .{ .gpu = source } };
+        for ([_]i64{ 0, 1, -2, -1 }) |axis_attr| {
+            const axis = normalizeAxis(axis_attr, shape.len);
+            const cols: usize = @intCast(shape[axis]);
+            const inner = try elementCount(shape[axis + 1 ..]);
+            const outer = try elementCount(shape[0..axis]);
+            for (0..2) |_| {
+                var values: std.StringHashMapUnmanaged(*Tensor) = .empty;
+                defer values.deinit(arena);
+                try values.put(arena, "x", &tensor);
+                try session.softmax(arena, &values, .{
+                    .op_type = "Softmax",
+                    .inputs = &.{"x"},
+                    .outputs = &.{"y"},
+                    .attributes = &.{.{ .name = "axis", .i = axis_attr }},
+                });
+                const output = values.get("y").?;
+                defer session.releaseStorage(output.data.gpu);
+                var actual: [24]f32 = undefined;
+                try downloadFloats(arena, try output.gpuBuffer(), actual[0..count]);
+                try std.testing.expectEqualSlices(i64, &shape, output.dims);
+                for (0..outer) |batch| for (0..inner) |position| {
+                    var total: f32 = 0;
+                    for (0..cols) |col| total += @exp(input[(batch * cols + col) * inner + position]);
+                    for (0..cols) |col| {
+                        const index = (batch * cols + col) * inner + position;
+                        const expected = @exp(input[index]) / total;
+                        try std.testing.expectApproxEqAbs(expected, actual[index], 0.002);
+                    }
+                };
+            }
+        }
+    }
 }
 
 test "INT8 DynamicQuantizeLinear and MatMulInteger math" {
