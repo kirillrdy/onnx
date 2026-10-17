@@ -244,13 +244,6 @@ pub fn Buffer(comptime T: type) type {
             _ = cuMemFree_v2(self.ptr);
         }
 
-        /// A view of `len` elements starting at `offset`, for handing one
-        /// plane of a larger allocation to a kernel.
-        pub fn slice(self: Self, offset: usize, len: usize) Self {
-            std.debug.assert(offset + len <= self.len);
-            return .{ .ptr = self.ptr + offset * @sizeOf(T), .len = len };
-        }
-
         pub fn upload(self: Self, host: []const T) Error!void {
             return self.uploadAt(0, host);
         }

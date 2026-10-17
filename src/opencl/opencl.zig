@@ -103,7 +103,6 @@ const c = std.c;
 
 var global_dispatch: ?*const Dispatch = null;
 var global_platform: cl_platform_id = null;
-var global_driver_handle: ?*anyopaque = null;
 var global_context: ?Context = null;
 
 var error_buf: [1024]u8 = undefined;
@@ -153,55 +152,25 @@ pub fn init() Error!void {
         setLastError("Could not locate OpenCL driver / ICD loader (libigdrcl.so or libOpenCL.so)");
         return Error.DriverNotFound;
     }
-    global_driver_handle = handle;
 
-    const clIcdGetPlatformIDsKHR_sym = c.dlsym(handle, "clIcdGetPlatformIDsKHR");
-    const clGetPlatformIDs_sym = c.dlsym(handle, "clGetPlatformIDs");
-
-    var plat: cl_platform_id = null;
-    var dispatch_ptr: *const Dispatch = undefined;
-
-    if (clIcdGetPlatformIDsKHR_sym != null) {
-        const clIcdGetPlatformIDsKHR: *const fn (cl_uint, ?[*]cl_platform_id, ?*cl_uint) callconv(.c) cl_int = @ptrCast(@alignCast(clIcdGetPlatformIDsKHR_sym));
-        var num_platforms: cl_uint = 0;
-        _ = clIcdGetPlatformIDsKHR(0, null, &num_platforms);
-        if (num_platforms == 0) {
-            setLastError("No OpenCL platforms found via ICD");
-            return Error.OpenCL;
-        }
-        var platforms: [8]cl_platform_id = undefined;
-        _ = clIcdGetPlatformIDsKHR(num_platforms, &platforms, null);
-        plat = platforms[0];
-        const raw_ptr: *const *const Dispatch = @ptrCast(@alignCast(plat.?));
-        dispatch_ptr = raw_ptr.*;
-    } else if (clGetPlatformIDs_sym != null) {
-        const clGetPlatformIDs: *const fn (cl_uint, ?[*]cl_platform_id, ?*cl_uint) callconv(.c) cl_int = @ptrCast(@alignCast(clGetPlatformIDs_sym));
-        var num_platforms: cl_uint = 0;
-        _ = clGetPlatformIDs(0, null, &num_platforms);
-        if (num_platforms == 0) {
-            setLastError("No OpenCL platforms found");
-            return Error.OpenCL;
-        }
-        var platforms: [8]cl_platform_id = undefined;
-        _ = clGetPlatformIDs(num_platforms, &platforms, null);
-        plat = platforms[0];
-        const raw_ptr: *const *const Dispatch = @ptrCast(@alignCast(plat.?));
-        dispatch_ptr = raw_ptr.*;
-    } else {
+    const get_platforms_sym = c.dlsym(handle, "clIcdGetPlatformIDsKHR") orelse
+        c.dlsym(handle, "clGetPlatformIDs") orelse {
         setLastError("Driver library does not export clIcdGetPlatformIDsKHR or clGetPlatformIDs");
         return Error.DriverNotFound;
+    };
+    const getPlatforms: *const fn (cl_uint, ?[*]cl_platform_id, ?*cl_uint) callconv(.c) cl_int = @ptrCast(@alignCast(get_platforms_sym));
+    var num_platforms: cl_uint = 0;
+    _ = getPlatforms(0, null, &num_platforms);
+    if (num_platforms == 0) {
+        setLastError("No OpenCL platforms found");
+        return Error.OpenCL;
     }
-
+    var platforms: [8]cl_platform_id = undefined;
+    _ = getPlatforms(num_platforms, &platforms, null);
+    const plat = platforms[0];
+    const raw_ptr: *const *const Dispatch = @ptrCast(@alignCast(plat.?));
     global_platform = plat;
-    global_dispatch = dispatch_ptr;
-}
-
-fn getDispatch() *const Dispatch {
-    return global_dispatch.?;
-}
-
-fn getPlatform() cl_platform_id {
-    return global_platform;
+    global_dispatch = raw_ptr.*;
 }
 
 pub const Dim = struct { x: u32 = 1, y: u32 = 1, z: u32 = 1 };
@@ -214,8 +183,8 @@ pub const Context = struct {
 
     pub fn init(ordinal: u32) Error!Context {
         try opencl.init();
-        const dispatch = getDispatch();
-        const plat = getPlatform();
+        const dispatch = global_dispatch.?;
+        const plat = global_platform;
 
         var num_devices: cl_uint = 0;
         try check(dispatch.clGetDeviceIDs.?(plat, CL_DEVICE_TYPE_GPU, 0, null, &num_devices));
@@ -270,11 +239,7 @@ pub const Module = struct {
     context: Context,
 
     pub fn load(source: [:0]const u8) Error!Module {
-        const ctx = global_context orelse try Context.init(0);
-        return loadWithContext(ctx, source);
-    }
-
-    pub fn loadWithContext(context: Context, source: [:0]const u8) Error!Module {
+        const context = global_context orelse try Context.init(0);
         const dispatch = context.dispatch;
         var status: cl_int = 0;
         const sources = [_][*:0]const u8{source.ptr};
@@ -380,13 +345,8 @@ pub fn Buffer(comptime T: type) type {
         context: ?Context = null,
 
         pub fn alloc(len: usize) Error!Self {
-            const ctx = global_context orelse try Context.init(0);
-            return allocWithContext(ctx, len);
-        }
-
-        pub fn allocWithContext(ctx_opt: ?Context, len: usize) Error!Self {
-            if (len == 0) return .{ .ptr = null, .len = 0, .context = ctx_opt };
-            const context = ctx_opt orelse global_context orelse try Context.init(0);
+            const context = global_context orelse try Context.init(0);
+            if (len == 0) return .{ .ptr = null, .len = 0, .context = context };
             var status: cl_int = 0;
             const mem = context.dispatch.clCreateBuffer.?(
                 context.context,
@@ -406,26 +366,6 @@ pub fn Buffer(comptime T: type) type {
             } else if (global_dispatch) |dispatch| {
                 _ = dispatch.clReleaseMemObject.?(@ptrCast(self.ptr));
             }
-        }
-
-        pub fn slice(self: Self, offset: usize, len: usize) Self {
-            std.debug.assert(offset + len <= self.len);
-            if (offset == 0 and len == self.len) return self;
-            if (self.ptr == null) return .{ .ptr = null, .len = 0, .context = self.context };
-            const byte_offset = offset * @sizeOf(T);
-            const byte_size = len * @sizeOf(T);
-            const region = extern struct { origin: usize, size: usize }{ .origin = byte_offset, .size = byte_size };
-            if (byte_offset % 128 == 0 and global_driver_handle != null) {
-                const clCreateSubBuffer_fn: ?*const fn (cl_mem, cl_mem_flags, cl_uint, *const anyopaque, ?*cl_int) callconv(.c) cl_mem = @ptrCast(@alignCast(c.dlsym(global_driver_handle.?, "clCreateSubBuffer")));
-                if (clCreateSubBuffer_fn) |create_sub| {
-                    var status: cl_int = 0;
-                    const sub = create_sub(@ptrCast(self.ptr), CL_MEM_READ_WRITE, 0x4200, &region, &status);
-                    if (status == CL_SUCCESS) {
-                        return .{ .ptr = sub, .len = len, .context = self.context };
-                    }
-                }
-            }
-            return self;
         }
 
         pub fn upload(self: Self, host: []const T) Error!void {

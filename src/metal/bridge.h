@@ -33,7 +33,6 @@ int sam_metal_context_synchronize(SamMetalContext *context);
 SamMetalModule *sam_metal_module_create(SamMetalContext *context, const char *source);
 void sam_metal_module_destroy(SamMetalModule *module);
 SamMetalFunction *sam_metal_function_create(SamMetalModule *module, const char *name);
-void sam_metal_function_destroy(SamMetalFunction *function);
 int sam_metal_launch(SamMetalFunction *function, SamMetalDim grid, SamMetalDim block,
                      const SamMetalArg *args, size_t arg_count);
 

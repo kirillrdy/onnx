@@ -66,7 +66,6 @@ pub fn addPtx(b: *std.Build, gpu_source: std.Build.LazyPath, options: PtxOptions
         "ptx_options",
     });
     cmd.addPrefixedFileArg("-Mroot=", options.root_source_file);
-    cmd.addArgs(&.{ "--dep", "ptx_options" });
     cmd.addPrefixedFileArg("-Mgpu=", gpu_source);
     cmd.addPrefixedFileArg("-Mptx_options=", ptx_options.getOutput());
     return cmd.addPrefixedOutputFileArg("-femit-asm=", "kernels.ptx");

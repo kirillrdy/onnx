@@ -57,7 +57,6 @@ pub const Device = struct {
     /// staging them through local memory, where the driver has them.
     attention_block: ?driver.Function,
     matmul: driver.Function,
-    matmul_post: ?driver.Function,
     /// The same product on the neural accelerators the Apple GPUs carry from
     /// the M5 on, which Metal 4 reaches through its tensor operations.
     matmul_tensor: ?driver.Function,
@@ -132,7 +131,6 @@ pub const Device = struct {
             .attention = if (@hasDecl(driver, "is_metal")) null else module.function("attention") catch null,
             .attention_block = if (@hasDecl(driver, "is_metal")) null else module.function("attentionBlock") catch null,
             .matmul = try module.function("matmul"),
-            .matmul_post = module.function("matmulPost") catch null,
             // A build that compiled the kernel out leaves no symbol behind, so
             // failing to find it is the answer rather than an error.
             .matmul_tensor = narrowing(module, "matmulTensor"),
@@ -177,9 +175,5 @@ pub const Device = struct {
 
     pub fn makeCurrent(self: Device) !void {
         return self.context.makeCurrent();
-    }
-
-    pub fn alloc(comptime T: type, count: usize) !driver.Buffer(T) {
-        return driver.Buffer(T).alloc(count);
     }
 };

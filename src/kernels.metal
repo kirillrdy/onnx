@@ -27,7 +27,7 @@ typedef float4 floatv;
 
 enum Binary {
     BIN_ADD = 0, BIN_SUB = 1, BIN_MUL = 2, BIN_DIV = 3, BIN_POW = 4,
-    BIN_MIN = 5, BIN_MAX = 6, BIN_EQUAL = 7, BIN_LESS = 8, BIN_GREATER = 9
+    BIN_MIN = 5, BIN_MAX = 6
 };
 
 enum Unary {
@@ -144,9 +144,6 @@ kernel void binary(
         case BIN_POW: res = power(x, y); break;
         case BIN_MIN: res = fmin(x, y); break;
         case BIN_MAX: res = fmax(x, y); break;
-        case BIN_EQUAL: res = (x == y) ? 1.0f : 0.0f; break;
-        case BIN_LESS: res = (x < y) ? 1.0f : 0.0f; break;
-        case BIN_GREATER: res = (x > y) ? 1.0f : 0.0f; break;
     }
     out[i] = res;
 }

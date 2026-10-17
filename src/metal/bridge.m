@@ -102,8 +102,6 @@ SamMetalFunction *sam_metal_function_create(SamMetalModule *module, const char *
     }
 }
 
-void sam_metal_function_destroy(SamMetalFunction *function) { free(function); }
-
 int sam_metal_launch(SamMetalFunction *function, SamMetalDim grid, SamMetalDim block,
                      const SamMetalArg *args, size_t arg_count) {
     @autoreleasepool {

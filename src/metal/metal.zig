@@ -107,11 +107,6 @@ pub fn Buffer(comptime T: type) type {
             c.sam_metal_buffer_destroy(self.ptr.buffer);
         }
 
-        pub fn slice(self: Self, offset: usize, len: usize) Self {
-            std.debug.assert(offset + len <= self.len);
-            return .{ .ptr = .{ .buffer = self.ptr.buffer, .offset = self.ptr.offset + offset * @sizeOf(T) }, .len = len };
-        }
-
         pub fn upload(self: Self, host: []const T) Error!void {
             return self.uploadAt(0, host);
         }

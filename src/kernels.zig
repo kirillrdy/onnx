@@ -15,7 +15,7 @@ const inf: f32 = @bitCast(@as(u32, 0x7f800000));
 const neg_inf: f32 = -inf;
 
 /// Elementwise binary operations, selected by `op`.
-const Binary = enum(u32) { add, sub, mul, div, pow, min, max, equal, less, greater };
+const Binary = enum(u32) { add, sub, mul, div, pow, min, max };
 
 /// Elementwise unary operations, selected by `op`.
 const Unary = enum(u32) { neg, erf, exp, sqrt, reciprocal, sigmoid, tanh, relu, abs, floor, sin, cos, log, sign, is_nan, gelu, ceil, round, leaky_relu };
@@ -78,9 +78,6 @@ fn binary(
         .pow => power(x, y),
         .min => @min(x, y),
         .max => @max(x, y),
-        .equal => if (x == y) 1 else 0,
-        .less => if (x < y) 1 else 0,
-        .greater => if (x > y) 1 else 0,
     };
 }
 
@@ -621,44 +618,25 @@ inline fn stageWait() void {
 }
 
 inline fn stageA(stage: u32, a: [*]addrspace(.global) const f32, a_base: u32, row_base: u32, m: u32, k: u32, step: u32, thread: u32) void {
-    const r0 = thread / 4;
-    const c0 = (thread % 4) * 4;
-    const r1 = 64 + (thread / 4);
-    const c1 = (thread % 4) * 4;
-
-    if (row_base + r0 < m) {
-        const offset0 = a_base + (row_base + r0) * k + step + c0;
-        if (offset0 % 4 == 0 and step + c0 + 4 <= k) {
-            stageGlobalFloat4(&mm_sa[stage][r0][c0], a + offset0);
+    const c = (thread % 4) * 4;
+    inline for (0..2) |pass| {
+        const r = @as(u32, @intCast(pass)) * 64 + (thread / 4);
+        if (row_base + r < m) {
+            const offset = a_base + (row_base + r) * k + step + c;
+            if (offset % 4 == 0 and step + c + 4 <= k) {
+                stageGlobalFloat4(&mm_sa[stage][r][c], a + offset);
+            } else {
+                inline for (0..4) |idx| {
+                    mm_sa[stage][r][c + idx] = if (step + c + idx < k)
+                        a[a_base + (row_base + r) * k + step + c + idx]
+                    else
+                        0;
+                }
+            }
         } else {
             inline for (0..4) |idx| {
-                mm_sa[stage][r0][c0 + idx] = if (step + c0 + idx < k)
-                    a[a_base + (row_base + r0) * k + step + c0 + idx]
-                else
-                    0;
+                mm_sa[stage][r][c + idx] = 0;
             }
-        }
-    } else {
-        inline for (0..4) |idx| {
-            mm_sa[stage][r0][c0 + idx] = 0;
-        }
-    }
-
-    if (row_base + r1 < m) {
-        const offset1 = a_base + (row_base + r1) * k + step + c1;
-        if (offset1 % 4 == 0 and step + c1 + 4 <= k) {
-            stageGlobalFloat4(&mm_sa[stage][r1][c1], a + offset1);
-        } else {
-            inline for (0..4) |idx| {
-                mm_sa[stage][r1][c1 + idx] = if (step + c1 + idx < k)
-                    a[a_base + (row_base + r1) * k + step + c1 + idx]
-                else
-                    0;
-            }
-        }
-    } else {
-        inline for (0..4) |idx| {
-            mm_sa[stage][r1][c1 + idx] = 0;
         }
     }
 }
@@ -674,56 +652,31 @@ inline fn stageB(
     thread: u32,
     comptime transposed: bool,
 ) void {
-    const r0 = thread / 32;
-    const c0 = (thread % 32) * 4;
-    const r1 = 8 + (thread / 32);
-    const c1 = (thread % 32) * 4;
-
-    if (transposed) {
-        inline for (0..4) |idx| {
-            mm_sb[stage][r0][c0 + idx] = if (col_base + c0 + idx < n and step + r0 < k)
-                b[b_base + (col_base + c0 + idx) * k + step + r0]
-            else
-                0;
-            mm_sb[stage][r1][c1 + idx] = if (col_base + c1 + idx < n and step + r1 < k)
-                b[b_base + (col_base + c1 + idx) * k + step + r1]
-            else
-                0;
-        }
-    } else {
-        if (step + r0 < k) {
-            const offset0 = b_base + (step + r0) * n + col_base + c0;
-            if (offset0 % 4 == 0 and col_base + c0 + 4 <= n) {
-                stageGlobalFloat4(&mm_sb[stage][r0][c0], b + offset0);
+    const c = (thread % 32) * 4;
+    inline for (0..2) |pass| {
+        const r = @as(u32, @intCast(pass)) * 8 + (thread / 32);
+        if (transposed) {
+            inline for (0..4) |idx| {
+                mm_sb[stage][r][c + idx] = if (col_base + c + idx < n and step + r < k)
+                    b[b_base + (col_base + c + idx) * k + step + r]
+                else
+                    0;
+            }
+        } else if (step + r < k) {
+            const offset = b_base + (step + r) * n + col_base + c;
+            if (offset % 4 == 0 and col_base + c + 4 <= n) {
+                stageGlobalFloat4(&mm_sb[stage][r][c], b + offset);
             } else {
                 inline for (0..4) |idx| {
-                    mm_sb[stage][r0][c0 + idx] = if (col_base + c0 + idx < n)
-                        b[b_base + (step + r0) * n + col_base + c0 + idx]
+                    mm_sb[stage][r][c + idx] = if (col_base + c + idx < n)
+                        b[b_base + (step + r) * n + col_base + c + idx]
                     else
                         0;
                 }
             }
         } else {
             inline for (0..4) |idx| {
-                mm_sb[stage][r0][c0 + idx] = 0;
-            }
-        }
-
-        if (step + r1 < k) {
-            const offset1 = b_base + (step + r1) * n + col_base + c1;
-            if (offset1 % 4 == 0 and col_base + c1 + 4 <= n) {
-                stageGlobalFloat4(&mm_sb[stage][r1][c1], b + offset1);
-            } else {
-                inline for (0..4) |idx| {
-                    mm_sb[stage][r1][c1 + idx] = if (col_base + c1 + idx < n)
-                        b[b_base + (step + r1) * n + col_base + c1 + idx]
-                    else
-                        0;
-                }
-            }
-        } else {
-            inline for (0..4) |idx| {
-                mm_sb[stage][r1][c1 + idx] = 0;
+                mm_sb[stage][r][c + idx] = 0;
             }
         }
     }
@@ -755,21 +708,23 @@ fn matmul(
     }
 }
 
-fn matmulPost(
-    values: [*]addrspace(.global) f32,
-    bias: [*]addrspace(.global) const f32,
-    count: u32,
-    columns: u32,
-    has_bias: u32,
-    activation: u32,
-) callconv(.kernel) void {
-    const i = gpu.globalIndex();
-    if (i >= count) return;
-    const value = values[i] + if (has_bias != 0) bias[i % columns] else 0;
-    values[i] = if (activation != 0)
-        0.5 * value * (1.0 + erf(value * 0.7071067811865476))
-    else
-        value;
+inline fn stepMatmulTile(read_stage: u32, thread_row_base: u32, thread_col_base: u32, acc: *[mm_rows][mm_cols]f32) void {
+    inline for (0..mm_bk) |depth| {
+        var a_reg: [mm_rows]f32 = undefined;
+        inline for (0..mm_rows) |i| {
+            a_reg[i] = mm_sa[read_stage][thread_row_base + i][depth];
+        }
+        const b_vec0 = gpu.loadSharedFloat4(&mm_sb[read_stage][depth][thread_col_base + 0]);
+        const b_vec1 = gpu.loadSharedFloat4(&mm_sb[read_stage][depth][thread_col_base + 4]);
+        inline for (0..mm_rows) |i| {
+            inline for (0..4) |j| {
+                acc[i][j] = @mulAdd(f32, a_reg[i], b_vec0[j], acc[i][j]);
+            }
+            inline for (0..4) |j| {
+                acc[i][4 + j] = @mulAdd(f32, a_reg[i], b_vec1[j], acc[i][4 + j]);
+            }
+        }
+    }
 }
 
 inline fn matmulTiled(
@@ -835,46 +790,14 @@ inline fn matmulTiled(
         stageB(write_stage, b, b_base, col_base, n, k, step, thread, transposed);
         stageCommit();
 
-        const read_stage = write_stage ^ 1;
-        inline for (0..mm_bk) |depth| {
-            var a_reg: [mm_rows]f32 = undefined;
-            inline for (0..mm_rows) |i| {
-                a_reg[i] = mm_sa[read_stage][thread_row_base + i][depth];
-            }
-            const b_vec0 = gpu.loadSharedFloat4(&mm_sb[read_stage][depth][thread_col_base + 0]);
-            const b_vec1 = gpu.loadSharedFloat4(&mm_sb[read_stage][depth][thread_col_base + 4]);
-            inline for (0..mm_rows) |i| {
-                inline for (0..4) |j| {
-                    acc[i][j] = @mulAdd(f32, a_reg[i], b_vec0[j], acc[i][j]);
-                }
-                inline for (0..4) |j| {
-                    acc[i][4 + j] = @mulAdd(f32, a_reg[i], b_vec1[j], acc[i][4 + j]);
-                }
-            }
-        }
+        stepMatmulTile(write_stage ^ 1, thread_row_base, thread_col_base, &acc);
 
         stageWait();
         gpu.syncThreads();
         write_stage ^= 1;
     }
 
-    const final_read_stage = write_stage ^ 1;
-    inline for (0..mm_bk) |depth| {
-        var a_reg: [mm_rows]f32 = undefined;
-        inline for (0..mm_rows) |i| {
-            a_reg[i] = mm_sa[final_read_stage][thread_row_base + i][depth];
-        }
-        const b_vec0 = gpu.loadSharedFloat4(&mm_sb[final_read_stage][depth][thread_col_base + 0]);
-        const b_vec1 = gpu.loadSharedFloat4(&mm_sb[final_read_stage][depth][thread_col_base + 4]);
-        inline for (0..mm_rows) |i| {
-            inline for (0..4) |j| {
-                acc[i][j] = @mulAdd(f32, a_reg[i], b_vec0[j], acc[i][j]);
-            }
-            inline for (0..4) |j| {
-                acc[i][4 + j] = @mulAdd(f32, a_reg[i], b_vec1[j], acc[i][4 + j]);
-            }
-        }
-    }
+    stepMatmulTile(write_stage ^ 1, thread_row_base, thread_col_base, &acc);
 
     inline for (0..mm_rows) |i| {
         const row = row_base + thread_row_base + i;
@@ -970,56 +893,31 @@ inline fn stageTensorB(
     thread: u32,
     comptime transposed: bool,
 ) void {
-    const r0 = thread / 16;
-    const c0 = (thread % 16) * 4;
-    const r1 = 8 + r0;
-    const c1 = c0;
-
-    if (transposed) {
-        inline for (0..4) |idx| {
-            tc_sb[stage][r0][c0 + idx] = if (col_base + c0 + idx < n and step + r0 < k)
-                b[b_base + (col_base + c0 + idx) * k + step + r0]
-            else
-                0;
-            tc_sb[stage][r1][c1 + idx] = if (col_base + c1 + idx < n and step + r1 < k)
-                b[b_base + (col_base + c1 + idx) * k + step + r1]
-            else
-                0;
-        }
-    } else {
-        if (step + r0 < k) {
-            const offset0 = b_base + (step + r0) * n + col_base + c0;
-            if (offset0 % 4 == 0 and col_base + c0 + 4 <= n) {
-                stageGlobalFloat4(&tc_sb[stage][r0][c0], b + offset0);
+    const c = (thread % 16) * 4;
+    inline for (0..2) |pass| {
+        const r = @as(u32, @intCast(pass)) * 8 + (thread / 16);
+        if (transposed) {
+            inline for (0..4) |idx| {
+                tc_sb[stage][r][c + idx] = if (col_base + c + idx < n and step + r < k)
+                    b[b_base + (col_base + c + idx) * k + step + r]
+                else
+                    0;
+            }
+        } else if (step + r < k) {
+            const offset = b_base + (step + r) * n + col_base + c;
+            if (offset % 4 == 0 and col_base + c + 4 <= n) {
+                stageGlobalFloat4(&tc_sb[stage][r][c], b + offset);
             } else {
                 inline for (0..4) |idx| {
-                    tc_sb[stage][r0][c0 + idx] = if (col_base + c0 + idx < n)
-                        b[offset0 + idx]
+                    tc_sb[stage][r][c + idx] = if (col_base + c + idx < n)
+                        b[offset + idx]
                     else
                         0;
                 }
             }
         } else {
             inline for (0..4) |idx| {
-                tc_sb[stage][r0][c0 + idx] = 0;
-            }
-        }
-
-        if (step + r1 < k) {
-            const offset1 = b_base + (step + r1) * n + col_base + c1;
-            if (offset1 % 4 == 0 and col_base + c1 + 4 <= n) {
-                stageGlobalFloat4(&tc_sb[stage][r1][c1], b + offset1);
-            } else {
-                inline for (0..4) |idx| {
-                    tc_sb[stage][r1][c1 + idx] = if (col_base + c1 + idx < n)
-                        b[offset1 + idx]
-                    else
-                        0;
-                }
-            }
-        } else {
-            inline for (0..4) |idx| {
-                tc_sb[stage][r1][c1 + idx] = 0;
+                tc_sb[stage][r][c + idx] = 0;
             }
         }
     }
@@ -1046,6 +944,42 @@ fn matmulTensor(
         matmulTensorTiled(a, b, c, m, n, k, a_batch, b_batch, c_batch, bias, has_bias, activation, block_m, block_n, true);
     } else {
         matmulTensorTiled(a, b, c, m, n, k, a_batch, b_batch, c_batch, bias, has_bias, activation, block_m, block_n, false);
+    }
+}
+
+inline fn stepTensorTile(read_stage: u32, wid_m: u32, wid_n: u32, group: u32, thread_in_group: u32, acc: *[4][4][4]f32) void {
+    inline for (0..2) |k_step| {
+        const k_off = k_step * 8;
+        var a_reg: [4][4]f32 = undefined;
+        inline for (0..4) |m_blk| {
+            const r0 = wid_m * 64 + m_blk * 16 + group;
+            const r1 = wid_m * 64 + m_blk * 16 + group + 8;
+            const c0 = k_off + thread_in_group * 2;
+            const a02 = gpu.loadSharedFloat2(&tc_sa[read_stage][r0][c0]);
+            const a13 = gpu.loadSharedFloat2(&tc_sa[read_stage][r1][c0]);
+            a_reg[m_blk][0] = a02[0];
+            a_reg[m_blk][1] = a13[0];
+            a_reg[m_blk][2] = a02[1];
+            a_reg[m_blk][3] = a13[1];
+        }
+
+        var b_reg: [4][2]f32 = undefined;
+        inline for (0..4) |n_blk| {
+            const r = k_off + thread_in_group * 2;
+            const col = wid_n * 32 + n_blk * 8 + group;
+            b_reg[n_blk][0] = tc_sb[read_stage][r + 0][col];
+            b_reg[n_blk][1] = tc_sb[read_stage][r + 1][col];
+        }
+
+        inline for (0..4) |m_blk| {
+            inline for (0..4) |n_blk| {
+                acc[m_blk][n_blk] = gpu.mmaSyncM16N8K8(
+                    a_reg[m_blk],
+                    b_reg[n_blk],
+                    acc[m_blk][n_blk],
+                );
+            }
+        }
     }
 }
 
@@ -1110,81 +1044,14 @@ inline fn matmulTensorTiled(
         stageTensorB(write_stage, b, b_base, col_base, n, k, step, thread, transposed);
         stageCommit();
 
-        const read_stage = write_stage ^ 1;
-
-        inline for (0..2) |k_step| {
-            const k_off = k_step * 8;
-            var a_reg: [4][4]f32 = undefined;
-            inline for (0..4) |m_blk| {
-                const r0 = wid_m * 64 + m_blk * 16 + group;
-                const r1 = wid_m * 64 + m_blk * 16 + group + 8;
-                const c0 = k_off + thread_in_group * 2;
-                const a02 = gpu.loadSharedFloat2(&tc_sa[read_stage][r0][c0]);
-                const a13 = gpu.loadSharedFloat2(&tc_sa[read_stage][r1][c0]);
-                a_reg[m_blk][0] = a02[0];
-                a_reg[m_blk][1] = a13[0];
-                a_reg[m_blk][2] = a02[1];
-                a_reg[m_blk][3] = a13[1];
-            }
-
-            var b_reg: [4][2]f32 = undefined;
-            inline for (0..4) |n_blk| {
-                const r = k_off + thread_in_group * 2;
-                const col = wid_n * 32 + n_blk * 8 + group;
-                b_reg[n_blk][0] = tc_sb[read_stage][r + 0][col];
-                b_reg[n_blk][1] = tc_sb[read_stage][r + 1][col];
-            }
-
-            inline for (0..4) |m_blk| {
-                inline for (0..4) |n_blk| {
-                    acc[m_blk][n_blk] = gpu.mmaSyncM16N8K8(
-                        a_reg[m_blk],
-                        b_reg[n_blk],
-                        acc[m_blk][n_blk],
-                    );
-                }
-            }
-        }
+        stepTensorTile(write_stage ^ 1, wid_m, wid_n, group, thread_in_group, &acc);
 
         stageWait();
         gpu.syncThreads();
         write_stage ^= 1;
     }
 
-    const final_read_stage = write_stage ^ 1;
-    inline for (0..2) |k_step| {
-        const k_off = k_step * 8;
-        var a_reg: [4][4]f32 = undefined;
-        inline for (0..4) |m_blk| {
-            const r0 = wid_m * 64 + m_blk * 16 + group;
-            const r1 = wid_m * 64 + m_blk * 16 + group + 8;
-            const c0 = k_off + thread_in_group * 2;
-            const a02 = gpu.loadSharedFloat2(&tc_sa[final_read_stage][r0][c0]);
-            const a13 = gpu.loadSharedFloat2(&tc_sa[final_read_stage][r1][c0]);
-            a_reg[m_blk][0] = a02[0];
-            a_reg[m_blk][1] = a13[0];
-            a_reg[m_blk][2] = a02[1];
-            a_reg[m_blk][3] = a13[1];
-        }
-
-        var b_reg: [4][2]f32 = undefined;
-        inline for (0..4) |n_blk| {
-            const r = k_off + thread_in_group * 2;
-            const col = wid_n * 32 + n_blk * 8 + group;
-            b_reg[n_blk][0] = tc_sb[final_read_stage][r + 0][col];
-            b_reg[n_blk][1] = tc_sb[final_read_stage][r + 1][col];
-        }
-
-        inline for (0..4) |m_blk| {
-            inline for (0..4) |n_blk| {
-                acc[m_blk][n_blk] = gpu.mmaSyncM16N8K8(
-                    a_reg[m_blk],
-                    b_reg[n_blk],
-                    acc[m_blk][n_blk],
-                );
-            }
-        }
-    }
+    stepTensorTile(write_stage ^ 1, wid_m, wid_n, group, thread_in_group, &acc);
 
     // Epilogue
     inline for (0..4) |m_blk| {
@@ -2007,7 +1874,7 @@ export fn anchor() usize {
         @intFromPtr(&gather) ^ @intFromPtr(&layerNorm) ^
         @intFromPtr(&softmax) ^ @intFromPtr(&matmul) ^
         (if (ptx_options.ampere_or_newer) @intFromPtr(&matmulTensor) else 0) ^
-        @intFromPtr(&matmulPost) ^ @intFromPtr(&conv2d) ^
+        @intFromPtr(&conv2d) ^
         @intFromPtr(&convTranspose2d) ^ @intFromPtr(&convTranspose2dGemm) ^
         @intFromPtr(&rope) ^ @intFromPtr(&ropeVec) ^ @intFromPtr(&attention);
 }
