@@ -133,14 +133,14 @@ pub const Device = struct {
             .matmul = try module.function("matmul"),
             // A build that compiled the kernel out leaves no symbol behind, so
             // failing to find it is the answer rather than an error.
-            .matmul_tensor = narrowing(module, "matmulTensor"),
+            .matmul_tensor = module.function("matmulTensor") catch null,
             .matmul_simd = module.function("matmulSimd") catch null,
-            .matmul_xmx = narrowing(module, "matmulXmx"),
-            .matmul_xmx_block = narrowing(module, "matmulXmxBlock"),
+            .matmul_xmx = module.function("matmulXmx") catch null,
+            .matmul_xmx_block = module.function("matmulXmxBlock") catch null,
             .conv2d = try module.function("conv2d"),
             .conv2d_gemm = try module.function("conv2dGemm"),
-            .conv2d_gemm_xmx = narrowing(module, "conv2dGemmXmx"),
-            .conv2d_gemm_tensor = narrowing(module, "conv2dGemmTensor"),
+            .conv2d_gemm_xmx = module.function("conv2dGemmXmx") catch null,
+            .conv2d_gemm_tensor = module.function("conv2dGemmTensor") catch null,
             .matmul_nbits = try module.function("matmulNBits"),
             .matmul_nbits_tensor = module.function("matmulNBitsTensor") catch null,
             .cumulative_sum = try module.function("cumulativeSum"),
@@ -154,13 +154,6 @@ pub const Device = struct {
             .conv_transpose2d_gemm = try module.function("convTranspose2dGemm"),
             .pixel_shuffle = module.function("pixelShuffle") catch null,
         };
-    }
-
-    /// A matrix kernel that narrows float32 operands; left unloaded when the
-    /// build opts out of reduced precision.
-    fn narrowing(module: driver.Module, name: []const u8) ?driver.Function {
-        if (!build_options.reduced_precision) return null;
-        return module.function(name) catch null;
     }
 
     pub fn deinit(self: *Device) void {
