@@ -90,11 +90,7 @@ pub fn build(b: *std.Build) void {
     // moves, so storing tensors as halves is most of what these graphs cost.
     // It is also the precision GPU execution providers commonly use. The
     // OpenCL and Metal kernels support it; the CUDA ones stay float.
-    const half = b.option(
-        bool,
-        "half",
-        "Store float tensors on the device as halves (default: true on opencl and metal)",
-    ) orelse (backend != .cuda);
+    const half = backend != .cuda;
 
     var driver_mod: *std.Build.Module = undefined;
     var kernels: std.Build.LazyPath = undefined;
@@ -158,7 +154,7 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("kernels", .{ .root_source_file = kernels });
 
     const options = b.addOptions();
-    options.addOption(bool, "half", half and backend != .cuda);
+    options.addOption(bool, "half", half);
     mod.addOptions("build_options", options);
 
     const tests = b.addTest(.{ .root_module = mod });
