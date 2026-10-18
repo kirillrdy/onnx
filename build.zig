@@ -2,8 +2,7 @@ const std = @import("std");
 
 pub const Backend = enum { cuda, opencl, metal };
 
-/// Compute capability of an Ada RTX card.
-pub const default_cuda_arch = "sm_89";
+const default_cuda_arch = "sm_89";
 
 /// Where the NVIDIA driver's libcuda tends to live. It ships with the driver,
 /// not with the CUDA toolkit, so there is nothing else to install.
@@ -87,12 +86,6 @@ pub fn build(b: *std.Build) void {
         "Compute capability the CUDA kernels are built for (default: " ++ default_cuda_arch ++ ")",
     ) orelse default_cuda_arch;
 
-    const cuda_library_path_opt = b.option(
-        []const u8,
-        "cuda-library-path",
-        "Directory holding the driver's libcuda.so, for when this does not find it itself",
-    );
-
     // Every operator but the matrix product is bound by how many bytes it
     // moves, so storing tensors as halves is most of what these graphs cost.
     // It is also the precision GPU execution providers commonly use. The
@@ -108,8 +101,8 @@ pub fn build(b: *std.Build) void {
 
     switch (backend) {
         .cuda => {
-            const cuda_library_path = cuda_library_path_opt orelse findCudaLibrary(b) orelse {
-                std.log.err("no libcuda.so found; pass -Dcuda-library-path=DIR", .{});
+            const cuda_library_path = findCudaLibrary(b) orelse {
+                std.log.err("no libcuda.so found in the standard NVIDIA driver library directories", .{});
                 std.process.exit(1);
             };
             driver_mod = b.createModule(.{
