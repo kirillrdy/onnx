@@ -3818,6 +3818,24 @@ const SessionState = struct {
         if (rank > max_rank) return Error.RankTooLarge;
         const count = try elementCount(dims);
 
+        // A uniform host mask selects one whole branch. Keep its storage when
+        // it already has the output shape; broadcasting still needs the kernel.
+        if (condition.dtype == .bool and condition.onHost() and a.dtype == b.dtype and
+            (a.dtype == .f32 or a.dtype == .i64 or a.dtype == .i32))
+        {
+            const mask_values = try condition.bools();
+            if (mask_values.len != 0) {
+                const selected_true = mask_values[0] != 0;
+                for (mask_values[1..]) |value| {
+                    if ((value != 0) != selected_true) break;
+                } else {
+                    const selected = if (selected_true) a else b;
+                    if (std.mem.eql(i64, selected.dims, dims))
+                        return self.put(arena, values, node.outputs[0], try self.alias(selected, dims));
+                }
+            }
+        }
+
         var cstrides: [max_rank]u32 = @splat(0);
         var astrides: [max_rank]u32 = @splat(0);
         var bstrides: [max_rank]u32 = @splat(0);
@@ -5372,4 +5390,109 @@ test "IntegerProduct matches the definition" {
         }
         try testing.expectEqual(expected, out[(batch * m + row) * n + col]);
     };
+}
+
+test "uniform Where aliases either GPU branch and survives releasing the input" {
+    const allocator = std.testing.allocator;
+    const env = try Env.init(allocator, std.testing.io);
+    defer env.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var session = SessionState{ .env = env.state, .graph = undefined, .arena = arena };
+    const input = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const shape = [_]i64{ 2, 3 };
+    const mask_shape = [_]i64{ 1, 3 };
+    const scalar_shape = [_]i64{1};
+    const scalar = [_]f32{9};
+    for ([_]u8{ 0, 1 }) |selected_true| {
+        const source = try session.newStorage(input.len);
+        try uploadFloats(arena, source.buffer, &input);
+        var tensor = Tensor{ .dtype = .f32, .dims = &shape, .data = .{ .gpu = source } };
+        defer session.release(&tensor);
+        var other = Tensor{ .dtype = .f32, .dims = &scalar_shape, .data = .{ .host = std.mem.sliceAsBytes(&scalar) } };
+        defer session.release(&other);
+        const mask_values = [_]u8{ selected_true, selected_true, selected_true };
+        var mask = Tensor{ .dtype = .bool, .dims = &mask_shape, .data = .{ .host = &mask_values } };
+        var values: std.StringHashMapUnmanaged(*Tensor) = .empty;
+        defer values.deinit(arena);
+        try values.put(arena, "mask", &mask);
+        try values.put(arena, "a", if (selected_true != 0) &tensor else &other);
+        try values.put(arena, "b", if (selected_true != 0) &other else &tensor);
+        try session.where(arena, &values, .{ .op_type = "Where", .inputs = &.{ "mask", "a", "b" }, .outputs = &.{"y"} });
+        const output = values.get("y").?;
+        defer session.release(output);
+        try std.testing.expectEqualSlices(i64, &shape, output.dims);
+        try std.testing.expect(output.data.gpu == source);
+        try std.testing.expectEqual(@as(usize, 2), source.references);
+        try std.testing.expect(other.onHost());
+        session.release(&tensor);
+        try std.testing.expectEqual(@as(usize, 1), source.references);
+        var actual: [input.len]f32 = undefined;
+        try downloadFloats(arena, try output.gpuBuffer(), &actual);
+        try std.testing.expectEqualSlices(f32, &input, &actual);
+    }
+}
+
+test "Where preserves mixed masks and broadcasts a uniformly selected scalar" {
+    const allocator = std.testing.allocator;
+    const env = try Env.init(allocator, std.testing.io);
+    defer env.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var session = SessionState{ .env = env.state, .graph = undefined, .arena = arena };
+    const input = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const shape = [_]i64{ 2, 3 };
+    const mask_shape = [_]i64{ 1, 3 };
+    const scalar_shape = [_]i64{1};
+    const scalar = [_]f32{9};
+    const masks = [_][3]u8{ .{ 0, 1, 0 }, .{ 1, 1, 1 } };
+    const expected = [_][6]f32{ .{ 1, 9, 3, 4, 9, 6 }, .{ 9, 9, 9, 9, 9, 9 } };
+    for (masks, expected) |mask_values, wanted| {
+        const source = try session.newStorage(input.len);
+        try uploadFloats(arena, source.buffer, &input);
+        var tensor = Tensor{ .dtype = .f32, .dims = &shape, .data = .{ .gpu = source } };
+        defer session.release(&tensor);
+        var other = Tensor{ .dtype = .f32, .dims = &scalar_shape, .data = .{ .host = std.mem.sliceAsBytes(&scalar) } };
+        defer session.release(&other);
+        var mask = Tensor{ .dtype = .bool, .dims = &mask_shape, .data = .{ .host = &mask_values } };
+        var values: std.StringHashMapUnmanaged(*Tensor) = .empty;
+        defer values.deinit(arena);
+        try values.put(arena, "mask", &mask);
+        try values.put(arena, "a", &other);
+        try values.put(arena, "b", &tensor);
+        try session.where(arena, &values, .{ .op_type = "Where", .inputs = &.{ "mask", "a", "b" }, .outputs = &.{"y"} });
+        const output = values.get("y").?;
+        defer session.release(output);
+        try std.testing.expect(output.data.gpu != source);
+        try std.testing.expectEqualSlices(i64, &shape, output.dims);
+        var actual: [input.len]f32 = undefined;
+        try downloadFloats(arena, try output.gpuBuffer(), &actual);
+        try std.testing.expectEqualSlices(f32, &wanted, &actual);
+    }
+}
+
+test "uniform Where preserves mixed integer type promotion" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var session = SessionState{ .env = undefined, .graph = undefined, .arena = arena };
+    const a_data = [_]i32{ 1, 2, 3 };
+    const b_data = [_]i64{9};
+    const shape = [_]i64{3};
+    const scalar_shape = [_]i64{1};
+    var a = Tensor{ .dtype = .i32, .dims = &shape, .data = .{ .host = std.mem.sliceAsBytes(&a_data) } };
+    var b = Tensor{ .dtype = .i64, .dims = &scalar_shape, .data = .{ .host = std.mem.sliceAsBytes(&b_data) } };
+    var mask = Tensor{ .dtype = .bool, .dims = &scalar_shape, .data = .{ .host = &.{1} } };
+    var values: std.StringHashMapUnmanaged(*Tensor) = .empty;
+    defer values.deinit(arena);
+    try values.put(arena, "mask", &mask);
+    try values.put(arena, "a", &a);
+    try values.put(arena, "b", &b);
+    try session.where(arena, &values, .{ .op_type = "Where", .inputs = &.{ "mask", "a", "b" }, .outputs = &.{"y"} });
+    const output = values.get("y").?;
+    try std.testing.expectEqual(.i64, output.dtype);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, try output.i64s());
 }
