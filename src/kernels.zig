@@ -9,8 +9,6 @@ const ptx_options = @import("ptx_options");
 
 pub const panic = gpu.panic;
 
-const max_rank = 8;
-
 const inf: f32 = @bitCast(@as(u32, 0x7f800000));
 const neg_inf: f32 = -inf;
 
@@ -263,14 +261,12 @@ fn rope(
     out: [*]addrspace(.global) f32,
     count: u32,
     period: u32,
-    scale: f32,
 ) callconv(.kernel) void {
     const i = gpu.globalIndex();
     if (i >= count) return;
     const table = wrap(i, period);
     const turned = if ((i & 1) != 0) x[i - 1] else -x[i + 1];
-    const value = x[i] * cosine[table] + turned * sine[table];
-    out[i] = value * scale;
+    out[i] = x[i] * cosine[table] + turned * sine[table];
 }
 
 fn ropeVec(
@@ -280,7 +276,6 @@ fn ropeVec(
     out: [*]addrspace(.global) f32,
     groups: u32,
     table_groups: u32,
-    scale: f32,
 ) callconv(.kernel) void {
     const i = gpu.globalIndex();
     if (i >= groups) return;
@@ -291,7 +286,7 @@ fn ropeVec(
     const s = if (table_groups != 0) gpu.loadGlobalFloat4(sine + table * 4) else @as([4]f32, @splat(sine[0]));
     var res: [4]f32 = undefined;
     inline for (0..4) |idx| {
-        res[idx] = (v[idx] * c[idx] + turned[idx] * s[idx]) * scale;
+        res[idx] = v[idx] * c[idx] + turned[idx] * s[idx];
     }
     gpu.storeGlobalFloat4(out + i * 4, res);
 }
@@ -413,7 +408,6 @@ fn gather(
     src: [*]addrspace(.global) const f32,
     indices: [*]addrspace(.global) const u32,
     dst: [*]addrspace(.global) f32,
-    outer: u32,
     axis: u32,
     inner: u32,
     index_count: u32,
@@ -425,7 +419,6 @@ fn gather(
     const inner_index = i % inner;
     const index = (i / inner) % index_count;
     const outer_index = i / (inner * index_count);
-    _ = outer;
 
     const source = indices[index];
     dst[i] = src[(outer_index * axis + source) * inner + inner_index];
@@ -1639,7 +1632,6 @@ fn convTranspose2dGemm(
     w: [*]addrspace(.global) const f32,
     bias: [*]addrspace(.global) const f32,
     out: [*]addrspace(.global) f32,
-    in_h: u32,
     in_w: u32,
     out_channels: u32,
     out_h: u32,
@@ -1651,7 +1643,6 @@ fn convTranspose2dGemm(
     k: u32,
     has_bias: u32,
 ) callconv(.kernel) void {
-    _ = in_h;
     const tx = gpu.threadIndex();
     const ty = gpu.threadIndexY();
     const thread = ty * mm_threads + tx;

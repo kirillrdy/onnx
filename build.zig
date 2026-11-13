@@ -70,6 +70,20 @@ pub fn addPtx(b: *std.Build, gpu_source: std.Build.LazyPath, options: PtxOptions
     return cmd.addPrefixedOutputFileArg("-femit-asm=", "kernels.ptx");
 }
 
+fn hasNvidiaDevice(io: std.Io) bool {
+    for ([_][]const u8{ "/dev/nvidiactl", "/dev/nvidia0", "/dev/nvidia" }) |path| {
+        std.Io.Dir.accessAbsolute(io, path, .{}) catch continue;
+        return true;
+    }
+    return false;
+}
+
+fn detectBackend(b: *std.Build, target: std.Build.ResolvedTarget) Backend {
+    if (target.result.os.tag.isDarwin()) return .metal;
+    if (hasNvidiaDevice(b.graph.io)) return .cuda;
+    return .opencl;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -77,8 +91,8 @@ pub fn build(b: *std.Build) void {
     const backend = b.option(
         Backend,
         "backend",
-        "GPU driver backend (cuda, opencl, or metal; default: opencl)",
-    ) orelse .opencl;
+        "GPU driver backend (cuda, opencl, or metal; default: auto-detect)",
+    ) orelse detectBackend(b, target);
 
     const cuda_arch = b.option(
         []const u8,

@@ -218,7 +218,7 @@ pub const Env = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !Env {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        var gpu = try device_mod.Device.init(io, 0);
+        var gpu = try device_mod.Device.init(0);
         errdefer gpu.deinit();
         const metadata = try driver.Buffer(u32).alloc(metadata_words);
         errdefer metadata.free();
@@ -1060,19 +1060,6 @@ const SessionState = struct {
         };
     }
 
-    /// The eleven operators a rotary embedding is spelled as, if `index` is
-    /// the Add that ends one:
-    ///
-    ///     Add(Mul(x, cos),
-    ///         Mul(Reshape(Concat(Unsqueeze(Neg(Squeeze(Split(Reshape(x))[1]))),
-    ///                            Unsqueeze(Squeeze(Split(Reshape(x))[0])))),
-    ///             sin))
-    ///
-    /// The reshapes and the split turn the last axis into pairs, and the
-    /// concatenation puts each pair back with the two swapped and the first
-    /// negated. Every intermediate has to be read by exactly one node, or
-    /// folding it away would take a value something else still wants; `x`
-    /// itself is read twice and stays.
     fn sliceMatches(self: *SessionState, at: usize, start_val: i64, end_val: i64) bool {
         const node = self.graph.nodes[at];
         if (!std.mem.eql(u8, node.op_type, "Slice") or node.inputs.len < 3) return false;
@@ -1859,7 +1846,6 @@ const SessionState = struct {
                 wb.ptr,
                 bias_buffer.ptr,
                 storage.buffer.ptr,
-                @as(u32, @intCast(x.dims[2])),
                 @as(u32, @intCast(x.dims[3])),
                 @as(u32, @intCast(weight.dims[1])),
                 @as(u32, @intCast(out_h)),
@@ -2026,7 +2012,6 @@ const SessionState = struct {
         if (data.dims.len == 0) return Error.InvalidShape;
         const axis = normalizeAxis(node.int("axis", 0), data.dims.len);
         const axis_len: usize = @intCast(data.dims[axis]);
-        const outer = try elementCount(data.dims[0..axis]);
         const inner = try elementCount(data.dims[axis + 1 ..]);
 
         // A scalar index contributes no dimensions, which is how Gather is
@@ -2074,7 +2059,7 @@ const SessionState = struct {
         const block: u32 = 256;
         try self.env.gpu.gather.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
             db.ptr,                           self.env.indices.ptr,         storage.buffer.ptr,
-            @as(u32, @intCast(outer)),        @as(u32, @intCast(axis_len)), @as(u32, @intCast(inner)),
+            @as(u32, @intCast(axis_len)),     @as(u32, @intCast(inner)),
             @as(u32, @intCast(resolved.len)), @as(u32, @intCast(count)),
         });
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
@@ -2515,8 +2500,8 @@ const SessionState = struct {
                 const table_groups = groupPeriod(count, period) orelse break :taken;
                 const groups: u32 = @intCast(count / lane_step);
                 try vec.launch(.{ .x = (groups + block - 1) / block }, .{ .x = block }, .{
-                    xb.ptr, cb.ptr,       sb.ptr,      storage.buffer.ptr,
-                    groups, table_groups, @as(f32, 1),
+                    xb.ptr, cb.ptr,       sb.ptr, storage.buffer.ptr,
+                    groups, table_groups,
                 });
                 return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
             }
@@ -2527,7 +2512,6 @@ const SessionState = struct {
                 storage.buffer.ptr,
                 @as(u32, @intCast(count)),
                 @as(u32, @intCast(period)),
-                @as(f32, 1),
             });
             return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
         }
@@ -2757,7 +2741,6 @@ const SessionState = struct {
         const axis = normalizeAxis(raw_axis, x.dims.len);
         if (x.dtype != .f32) return Error.UnsupportedOperator;
         if (x.dims.len > max_rank) return Error.RankTooLarge;
-        if (axis >= x.dims.len) return Error.InvalidShape;
         const cols: usize = @intCast(x.dims[axis]);
         if (cols == 0) return Error.InvalidShape;
         const count = try x.count();

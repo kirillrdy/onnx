@@ -61,7 +61,6 @@ pub const Attribute = struct {
     f: f32 = 0,
     s: []const u8 = "",
     ints: []const i64 = &.{},
-    floats: []const f32 = &.{},
     tensor: ?Tensor = null,
     /// The body of a control-flow operator. It shares the arena and the
     /// weight mapping of the graph that carries it, so it is never deinited
@@ -96,11 +95,9 @@ pub const Node = struct {
     }
 };
 
-/// A graph input or output. A dimension the export left symbolic reads -1.
+/// A graph input or output.
 pub const ValueInfo = struct {
     name: []const u8 = "",
-    dtype: DataType = .undefined,
-    dims: []const i64 = &.{},
 };
 
 pub const Graph = struct {
@@ -145,8 +142,6 @@ pub const Graph = struct {
     }
 
     pub fn deinit(self: *Graph) void {
-        self.constants.deinit(self.arena.allocator());
-        self.metadata.deinit(self.arena.allocator());
         self.arena.deinit();
         if (self.weights.len != 0) std.posix.munmap(self.weights);
         std.posix.munmap(self.file);
@@ -378,7 +373,6 @@ const Parser = struct {
         var r = reader;
         var attribute: Attribute = .{};
         var ints: std.ArrayList(i64) = .empty;
-        var floats: std.ArrayList(f32) = .empty;
 
         while (!r.eof()) {
             const f = try r.field();
@@ -393,14 +387,12 @@ const Parser = struct {
                     graph.* = try self.parseGraph(try r.sub());
                     attribute.graph = graph;
                 },
-                7 => try self.appendF32(&floats, &r, f.wire),
                 8 => try self.appendI64(&ints, &r, f.wire),
                 else => try r.skip(f.wire),
             }
         }
 
         attribute.ints = ints.items;
-        attribute.floats = floats.items;
         return attribute;
     }
 
@@ -480,56 +472,18 @@ const Parser = struct {
     }
 
     fn parseValueInfo(self: *Parser, reader: Reader) !ValueInfo {
+        _ = self;
         var r = reader;
         var info: ValueInfo = .{};
-        var dims: std.ArrayList(i64) = .empty;
 
         while (!r.eof()) {
             const f = try r.field();
             switch (f.number) {
                 1 => info.name = try r.slice(),
-                2 => {
-                    var type_proto = try r.sub();
-                    while (!type_proto.eof()) {
-                        const tf = try type_proto.field();
-                        if (tf.number != 1) {
-                            try type_proto.skip(tf.wire);
-                            continue;
-                        }
-                        var tensor_type = try type_proto.sub();
-                        while (!tensor_type.eof()) {
-                            const ef = try tensor_type.field();
-                            switch (ef.number) {
-                                1 => info.dtype = @enumFromInt(try tensor_type.varint()),
-                                2 => {
-                                    var shape = try tensor_type.sub();
-                                    while (!shape.eof()) {
-                                        const sf = try shape.field();
-                                        if (sf.number != 1) {
-                                            try shape.skip(sf.wire);
-                                            continue;
-                                        }
-                                        var dimension = try shape.sub();
-                                        var value: i64 = -1;
-                                        while (!dimension.eof()) {
-                                            const df = try dimension.field();
-                                            if (df.number == 1 and df.wire == 0) {
-                                                value = @bitCast(try dimension.varint());
-                                            } else try dimension.skip(df.wire);
-                                        }
-                                        try dims.append(self.arena, value);
-                                    }
-                                },
-                                else => try tensor_type.skip(ef.wire),
-                            }
-                        }
-                    }
-                },
                 else => try r.skip(f.wire),
             }
         }
 
-        info.dims = dims.items;
         return info;
     }
 };

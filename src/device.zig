@@ -33,8 +33,8 @@ pub const Device = struct {
     binary_vec: ?driver.Function,
     unary_vec: ?driver.Function,
     /// The rotary position embedding, whose eleven operators one pass does.
-    /// Absent on CUDA, like the vector kernels; `findFusions` looks for the
-    /// pattern only where the kernel exists to run it.
+    /// `findFusions` looks for the pattern only where the kernel exists to
+    /// run it.
     rope: ?driver.Function,
     rope_vec: ?driver.Function,
     copy: driver.Function,
@@ -96,8 +96,7 @@ pub const Device = struct {
     /// image, so that the product itself can be the one on the matrix engines.
     pixel_shuffle: ?driver.Function,
 
-    pub fn init(io: std.Io, ordinal: u32) !Device {
-        _ = io;
+    pub fn init(ordinal: u32) !Device {
         try driver.init();
         const context = try driver.Context.init(ordinal);
         errdefer context.deinit();
@@ -128,8 +127,8 @@ pub const Device = struct {
             .gather = try module.function("gather"),
             .layer_norm = try module.function("layerNorm"),
             .softmax = try module.function("softmax"),
-            .attention = if (@hasDecl(driver, "is_metal")) null else module.function("attention") catch null,
-            .attention_block = if (@hasDecl(driver, "is_metal")) null else module.function("attentionBlock") catch null,
+            .attention = module.function("attention") catch null,
+            .attention_block = module.function("attentionBlock") catch null,
             .matmul = try module.function("matmul"),
             // A build that compiled the kernel out leaves no symbol behind, so
             // failing to find it is the answer rather than an error.

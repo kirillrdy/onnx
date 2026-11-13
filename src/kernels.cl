@@ -312,16 +312,14 @@ __kernel void rope(
     __global const real* sine,
     __global real* out,
     uint count,
-    uint period,
-    float scale
+    uint period
 ) {
     uint i = get_global_id(0);
     if (i >= count) return;
     uint table = wrap(i, period);
     // Odd lanes take the element below them, even lanes the negated one above.
     float turned = (i & 1u) ? (float)x[i - 1] : -(float)x[i + 1];
-    float value = (float)x[i] * (float)cosine[table] + turned * (float)sine[table];
-    out[i] = (real)(value * scale);
+    out[i] = (real)((float)x[i] * (float)cosine[table] + turned * (float)sine[table]);
 }
 
 /// The same four elements to a work item. A group is two whole pairs whichever
@@ -333,8 +331,7 @@ __kernel void ropeVec(
     __global const real* sine,
     __global real* out,
     uint groups,
-    uint table_groups,
-    float scale
+    uint table_groups
 ) {
     uint i = get_global_id(0);
     if (i >= groups) return;
@@ -343,7 +340,7 @@ __kernel void ropeVec(
     floatv turned = (floatv)(-v.s1, v.s0, -v.s3, v.s2);
     floatv c = table_groups ? TO_FLOATV(VLOADV(table, cosine)) : (floatv)((float)cosine[0]);
     floatv s = table_groups ? TO_FLOATV(VLOADV(table, sine)) : (floatv)((float)sine[0]);
-    VSTOREV(TO_REALV((v * c + turned * s) * scale), i, out);
+    VSTOREV(TO_REALV(v * c + turned * s), i, out);
 }
 
 __kernel void copy(
@@ -502,7 +499,6 @@ __kernel void gather(
     __global const real* src,
     __global const uint* indices,
     __global real* dst,
-    uint outer,
     uint axis,
     uint inner,
     uint index_count,
@@ -963,7 +959,6 @@ __kernel void convTranspose2dGemm(
     __global const real* w,
     __global const real* bias,
     __global real* out,
-    uint in_h,
     uint in_w,
     uint out_channels,
     uint out_h,

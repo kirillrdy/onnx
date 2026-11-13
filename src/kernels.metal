@@ -279,8 +279,7 @@ kernel void unaryVec(
 /// table, and adds the two. Here it is one pass over x.
 ///
 /// `period` is how many elements of the tables go by before they repeat, the
-/// same broadcast `wrap` serves elsewhere. `scale` is the constant the graph
-/// follows the sum with, or one where it follows it with nothing.
+/// same broadcast `wrap` serves elsewhere.
 kernel void rope(
     device const real* x [[buffer(0)]],
     device const real* cosine [[buffer(1)]],
@@ -288,7 +287,6 @@ kernel void rope(
     device real* out [[buffer(3)]],
     constant uint& count [[buffer(4)]],
     constant uint& period [[buffer(5)]],
-    constant float& scale [[buffer(6)]],
     uint3 gid [[thread_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint3 group_id [[threadgroup_position_in_grid]],
@@ -299,8 +297,7 @@ kernel void rope(
     uint table = wrap(i, period);
     // Odd lanes take the element below them, even lanes the negated one above.
     float turned = (i & 1u) ? (float)x[i - 1] : -(float)x[i + 1];
-    float value = (float)x[i] * (float)cosine[table] + turned * (float)sine[table];
-    out[i] = (real)(value * scale);
+    out[i] = (real)((float)x[i] * (float)cosine[table] + turned * (float)sine[table]);
 }
 
 /// The same four elements to a work item. A group is two whole pairs whichever
@@ -313,7 +310,6 @@ kernel void ropeVec(
     device real* out [[buffer(3)]],
     constant uint& groups [[buffer(4)]],
     constant uint& table_groups [[buffer(5)]],
-    constant float& scale [[buffer(6)]],
     uint3 gid [[thread_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint3 group_id [[threadgroup_position_in_grid]],
@@ -326,7 +322,7 @@ kernel void ropeVec(
     floatv turned = floatv(-v.y, v.x, -v.w, v.z);
     floatv c = table_groups ? TO_FLOATV(VLOADV(table, cosine)) : floatv((float)cosine[0]);
     floatv s = table_groups ? TO_FLOATV(VLOADV(table, sine)) : floatv((float)sine[0]);
-    VSTOREV(TO_REALV((v * c + turned * s) * scale), i, out);
+    VSTOREV(TO_REALV(v * c + turned * s), i, out);
 }
 
 kernel void copy(
@@ -521,11 +517,10 @@ kernel void gather(
     device const real* src [[buffer(0)]],
     device const uint* indices [[buffer(1)]],
     device real* dst [[buffer(2)]],
-    constant uint& outer [[buffer(3)]],
-    constant uint& axis [[buffer(4)]],
-    constant uint& inner [[buffer(5)]],
-    constant uint& index_count [[buffer(6)]],
-    constant uint& count [[buffer(7)]],
+    constant uint& axis [[buffer(3)]],
+    constant uint& inner [[buffer(4)]],
+    constant uint& index_count [[buffer(5)]],
+    constant uint& count [[buffer(6)]],
     uint3 gid [[thread_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint3 group_id [[threadgroup_position_in_grid]],
@@ -1010,17 +1005,16 @@ kernel void convTranspose2dGemm(
     device const real* w [[buffer(1)]],
     device const real* bias [[buffer(2)]],
     device real* out [[buffer(3)]],
-    constant uint& in_h [[buffer(4)]],
-    constant uint& in_w [[buffer(5)]],
-    constant uint& out_channels [[buffer(6)]],
-    constant uint& out_h [[buffer(7)]],
-    constant uint& out_w [[buffer(8)]],
-    constant uint& kernel_h [[buffer(9)]],
-    constant uint& kernel_w [[buffer(10)]],
-    constant uint& m [[buffer(11)]],
-    constant uint& n [[buffer(12)]],
-    constant uint& k [[buffer(13)]],
-    constant uint& has_bias [[buffer(14)]],
+    constant uint& in_w [[buffer(4)]],
+    constant uint& out_channels [[buffer(5)]],
+    constant uint& out_h [[buffer(6)]],
+    constant uint& out_w [[buffer(7)]],
+    constant uint& kernel_h [[buffer(8)]],
+    constant uint& kernel_w [[buffer(9)]],
+    constant uint& m [[buffer(10)]],
+    constant uint& n [[buffer(11)]],
+    constant uint& k [[buffer(12)]],
+    constant uint& has_bias [[buffer(13)]],
     uint3 gid [[thread_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint3 group_id [[threadgroup_position_in_grid]],

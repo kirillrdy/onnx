@@ -10,7 +10,6 @@ pub const is_opencl = true;
 pub const Error = error{
     OpenCL,
     DriverNotFound,
-    OutOfMemory,
 };
 
 pub const cl_int = i32;
