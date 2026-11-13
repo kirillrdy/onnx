@@ -289,7 +289,7 @@ pub const Session = struct {
         output_names: []const [*:0]const u8,
         outputs: []Value,
     ) !void {
-        return self.state.run(input_names, inputs, output_names, outputs);
+        return self.state.runInner(input_names, inputs, output_names, outputs, false);
     }
 
     pub fn runDevice(
@@ -299,7 +299,7 @@ pub const Session = struct {
         output_names: []const [*:0]const u8,
         outputs: []Value,
     ) !void {
-        return self.state.runDevice(input_names, inputs, output_names, outputs);
+        return self.state.runInner(input_names, inputs, output_names, outputs, true);
     }
 };
 
@@ -472,26 +472,6 @@ const SessionState = struct {
         self.folded.deinit(allocator);
         if (self.constant_nodes) |*map| map.deinit(allocator);
         self.graph.deinit();
-    }
-
-    fn run(
-        self: *SessionState,
-        input_names: []const [*:0]const u8,
-        inputs: []const Value,
-        output_names: []const [*:0]const u8,
-        outputs: []Value,
-    ) !void {
-        return self.runInner(input_names, inputs, output_names, outputs, false);
-    }
-
-    fn runDevice(
-        self: *SessionState,
-        input_names: []const [*:0]const u8,
-        inputs: []const Value,
-        output_names: []const [*:0]const u8,
-        outputs: []Value,
-    ) !void {
-        return self.runInner(input_names, inputs, output_names, outputs, true);
     }
 
     fn runInner(
@@ -4996,29 +4976,18 @@ fn hostOffset(index: usize, dims: []const i64, strides: *const [max_rank]u32) us
 /// index map is known.
 fn hostSelect(arena: std.mem.Allocator, tensor: Tensor, sources: []const usize) ![]const u8 {
     switch (tensor.dtype) {
-        .i64 => {
-            const source = try tensor.i64s();
-            const out = try arena.alloc(i64, sources.len);
+        inline .i64, .f32, .i32, .u8, .i8, .bool => |dtype| {
+            const T = switch (dtype) {
+                .i64 => i64,
+                .f32 => f32,
+                .i32 => i32,
+                .u8, .i8, .bool => u8,
+                else => unreachable,
+            };
+            const source: []const T = @alignCast(std.mem.bytesAsSlice(T, tensor.data.host));
+            const out = try arena.alloc(T, sources.len);
             for (out, sources) |*value, index| value.* = source[index];
             return std.mem.sliceAsBytes(out);
-        },
-        .f32 => {
-            const source: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, tensor.data.host));
-            const out = try arena.alloc(f32, sources.len);
-            for (out, sources) |*value, index| value.* = source[index];
-            return std.mem.sliceAsBytes(out);
-        },
-        .i32 => {
-            const source: []const i32 = @alignCast(std.mem.bytesAsSlice(i32, tensor.data.host));
-            const out = try arena.alloc(i32, sources.len);
-            for (out, sources) |*value, index| value.* = source[index];
-            return std.mem.sliceAsBytes(out);
-        },
-        .u8, .i8, .bool => {
-            const source = tensor.data.host;
-            const out = try arena.alloc(u8, sources.len);
-            for (out, sources) |*value, index| value.* = source[index];
-            return out;
         },
         else => return Error.UnsupportedDataType,
     }
@@ -5247,9 +5216,9 @@ pub const Value = struct {
     }
 
     fn takeDevice(allocator: std.mem.Allocator, tensor: Tensor) !Value {
-        const dims = try allocator.dupe(i64, tensor.dims);
-        errdefer allocator.free(dims);
         if (tensor.dtype == .f32 and !tensor.onHost()) {
+            const dims = try allocator.dupe(i64, tensor.dims);
+            errdefer allocator.free(dims);
             const count = try tensor.count();
             const src_buf = try tensor.gpuBuffer();
             const buf = try driver.Buffer(Element).alloc(count);
@@ -5272,6 +5241,20 @@ test "compile the runtime API and GPU execution paths" {
     std.testing.refAllDecls(Env);
     std.testing.refAllDecls(Session);
     std.testing.refAllDecls(Value);
+}
+
+test "device outputs preserve host tensors without leaking their shape" {
+    const data = [_]i64{ 3, 5, 8 };
+    const value = try Value.takeDevice(std.testing.allocator, .{
+        .dtype = .i64,
+        .dims = &.{3},
+        .data = .{ .host = std.mem.sliceAsBytes(&data) },
+    });
+    defer value.deinit();
+
+    try std.testing.expect(value.gpu == null);
+    try std.testing.expectEqualSlices(i64, &.{3}, value.dims);
+    try std.testing.expectEqualSlices(i64, &data, try value.dataI64());
 }
 
 test "GPU Softmax matches the reference across tensor axes and repeated runs" {

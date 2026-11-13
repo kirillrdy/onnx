@@ -47,11 +47,10 @@ pub const Context = struct {
 
 pub const Module = struct {
     ptr: *c.SamMetalModule,
-    context: Context,
 
     pub fn load(source: [:0]const u8) Error!Module {
         const context = current_context orelse return Error.Metal;
-        return .{ .ptr = c.sam_metal_module_create(context.ptr, source.ptr) orelse return Error.Metal, .context = context };
+        return .{ .ptr = c.sam_metal_module_create(context.ptr, source.ptr) orelse return Error.Metal };
     }
 
     pub fn unload(self: Module) void {
