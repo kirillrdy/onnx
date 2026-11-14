@@ -501,7 +501,11 @@ const SessionState = struct {
         self.arena = arena;
 
         var values: std.StringHashMapUnmanaged(*Tensor) = .empty;
-        defer values.deinit(arena);
+        defer {
+            var it = values.valueIterator();
+            while (it.next()) |tensor_ptr| self.release(tensor_ptr.*);
+            values.deinit(arena);
+        }
 
         var uses: std.StringHashMapUnmanaged(usize) = .empty;
         defer uses.deinit(arena);
@@ -559,6 +563,8 @@ const SessionState = struct {
 
         try self.env.gpu.synchronize();
         self.env.metadataComplete();
+        var taken_outputs: usize = 0;
+        errdefer for (outputs[0..taken_outputs]) |out| out.deinit();
         for (output_names, outputs) |name_z, *output| {
             const name = std.mem.span(name_z);
             const tensor = values.get(name) orelse return Error.MissingValue;
@@ -566,15 +572,11 @@ const SessionState = struct {
                 try Value.takeDevice(self.env.allocator, tensor.*)
             else
                 try Value.take(self.env.allocator, tensor.*);
+            taken_outputs += 1;
             if (uses.getPtr(name)) |remaining| {
                 remaining.* -= 1;
                 if (remaining.* == 0) self.release(tensor);
             }
-        }
-
-        var it = values.valueIterator();
-        while (it.next()) |tensor_ptr| {
-            self.release(tensor_ptr.*);
         }
 
         // Whatever this run uploaded is on the device now that the queue has
@@ -1493,7 +1495,10 @@ const SessionState = struct {
             const entry = try self.constants.getOrPut(self.env.allocator, name);
             if (!entry.found_existing) {
                 entry.value_ptr.* = try driver.Buffer(Element).alloc(source.elementCount());
-                errdefer _ = self.constants.remove(name);
+                errdefer {
+                    entry.value_ptr.free();
+                    _ = self.constants.remove(name);
+                }
                 try uploadFloats(self.env.allocator, entry.value_ptr.*, source.f32s());
             }
             tensor.* = .{ .dtype = .f32, .dims = source.dims, .data = .{ .constant_gpu = entry.value_ptr.* } };
@@ -2765,7 +2770,7 @@ const SessionState = struct {
                     .Add => x + y,
                     .Sub => x - y,
                     .Mul => x * y,
-                    .Div => x / y,
+                    .Div => if (modulo) @mod(x, y) else x / y,
                     .Min => @min(x, y),
                     .Max => @max(x, y),
                     .Pow => std.math.pow(f32, x, y),
@@ -2773,6 +2778,8 @@ const SessionState = struct {
             }
             return self.put(arena, values, name, .{ .dtype = .f32, .dims = dims, .data = .{ .host = std.mem.sliceAsBytes(out) } });
         }
+
+        if (modulo) return Error.UnsupportedOperator;
 
         try self.ensureGpu(arena, a);
         try self.ensureGpu(arena, b);
@@ -5002,6 +5009,7 @@ pub const Value = struct {
     gpu: ?driver.Buffer(Element) = null,
     owned_allocator: ?std.mem.Allocator = null,
     owned_f32: ?[]f32 = null,
+    owned_f32_slot: ?*?[]f32 = null,
     owned_i64: ?[]i64 = null,
 
     pub fn deinit(self: Value) void {
@@ -5010,6 +5018,10 @@ pub const Value = struct {
         }
         if (self.owned_allocator) |allocator| {
             allocator.free(self.dims);
+            if (self.owned_f32_slot) |slot| {
+                if (slot.*) |data| allocator.free(data);
+                allocator.destroy(slot);
+            }
             if (self.owned_f32) |data| {
                 allocator.free(data);
             } else if (self.owned_i64) |data| {
@@ -5035,11 +5047,15 @@ pub const Value = struct {
     pub fn dataF32(self: Value) ![]const f32 {
         if (self.dtype != .f32) return Error.NativeRuntime;
         if (self.bytes.len == 0 and self.gpu != null) {
+            if (self.owned_f32_slot) |slot| {
+                if (slot.*) |cached| return cached;
+            }
             const count = try elementCount(self.dims);
             const allocator = self.owned_allocator orelse return Error.NativeRuntime;
             const data = try allocator.alloc(f32, count);
             errdefer allocator.free(data);
             try downloadFloats(allocator, self.gpu.?, data);
+            if (self.owned_f32_slot) |slot| slot.* = data;
             return data;
         }
         return @alignCast(std.mem.bytesAsSlice(f32, self.bytes));
@@ -5087,6 +5103,9 @@ pub const Value = struct {
         if (tensor.dtype == .f32 and !tensor.onHost()) {
             const dims = try allocator.dupe(i64, tensor.dims);
             errdefer allocator.free(dims);
+            const slot = try allocator.create(?[]f32);
+            slot.* = null;
+            errdefer allocator.destroy(slot);
             const count = try tensor.count();
             const src_buf = try tensor.gpuBuffer();
             const buf = try driver.Buffer(Element).alloc(count);
@@ -5098,6 +5117,7 @@ pub const Value = struct {
                 .dims = dims,
                 .gpu = buf,
                 .owned_allocator = allocator,
+                .owned_f32_slot = slot,
             };
         }
         return take(allocator, tensor);
@@ -5329,4 +5349,56 @@ test "uniform Where preserves mixed integer type promotion" {
     const output = values.get("y").?;
     try std.testing.expectEqual(.i64, output.dtype);
     try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, try output.i64s());
+}
+
+test "device Value dataF32 caches downloaded slice and frees on deinit" {
+    const allocator = std.testing.allocator;
+    const env = try Env.init(allocator, std.testing.io);
+    defer env.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var session = SessionState{ .env = env.state, .graph = undefined, .arena = arena };
+    const input = [_]f32{ 1, 2, 3, 4 };
+    const shape = [_]i64{4};
+    const source = try session.newStorage(input.len);
+    defer session.releaseStorage(source);
+    try uploadFloats(arena, source.buffer, &input);
+    const tensor = Tensor{ .dtype = .f32, .dims = &shape, .data = .{ .gpu = source } };
+    const value = try Value.takeDevice(allocator, tensor);
+    defer value.deinit();
+    try std.testing.expect(value.gpu != null);
+    const first = try value.dataF32();
+    const second = try value.dataF32();
+    try std.testing.expectEqual(first.ptr, second.ptr);
+    try std.testing.expectEqualSlices(f32, &input, first);
+}
+
+test "Mod computes host f32 remainder and rejects GPU f32 instead of dividing" {
+    const allocator = std.testing.allocator;
+    const env = try Env.init(allocator, std.testing.io);
+    defer env.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var session = SessionState{ .env = env.state, .graph = undefined, .arena = arena };
+    const a_data = [_]f32{ 5, 7, 9 };
+    const b_data = [_]f32{ 2, 4, 5 };
+    const shape = [_]i64{3};
+    var a_host = Tensor{ .dtype = .f32, .dims = &shape, .data = .{ .host = std.mem.sliceAsBytes(&a_data) } };
+    var b_host = Tensor{ .dtype = .f32, .dims = &shape, .data = .{ .host = std.mem.sliceAsBytes(&b_data) } };
+    var values: std.StringHashMapUnmanaged(*Tensor) = .empty;
+    defer values.deinit(arena);
+    try values.put(arena, "a", &a_host);
+    try values.put(arena, "b", &b_host);
+    try session.binary(arena, &values, .{ .op_type = "Mod", .inputs = &.{ "a", "b" }, .outputs = &.{"y"} }, .Div);
+    const out = values.get("y").?;
+    try std.testing.expectEqualSlices(f32, &.{ 1, 3, 4 }, @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, out.data.host))));
+
+    const gpu_storage = try session.newStorage(a_data.len);
+    defer session.releaseStorage(gpu_storage);
+    try uploadFloats(arena, gpu_storage.buffer, &a_data);
+    var a_gpu = Tensor{ .dtype = .f32, .dims = &shape, .data = .{ .gpu = gpu_storage } };
+    try values.put(arena, "ag", &a_gpu);
+    try std.testing.expectError(Error.UnsupportedOperator, session.binary(arena, &values, .{ .op_type = "Mod", .inputs = &.{ "ag", "b" }, .outputs = &.{"yg"} }, .Div));
 }

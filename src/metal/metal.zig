@@ -69,6 +69,10 @@ pub const Module = struct {
 pub const Function = struct {
     ptr: *c.SamMetalFunction,
 
+    pub fn deinit(self: Function) void {
+        c.sam_metal_function_destroy(self.ptr);
+    }
+
     pub fn launch(self: Function, grid: Dim, block: Dim, args: anytype) Error!void {
         if (grid.x == 0 or grid.y == 0 or grid.z == 0) return;
         if (block.x == 0 or block.y == 0 or block.z == 0) return;

@@ -165,7 +165,8 @@ pub fn init() Error!void {
         return Error.OpenCL;
     }
     var platforms: [8]cl_platform_id = undefined;
-    _ = getPlatforms(num_platforms, &platforms, null);
+    const platform_count: cl_uint = @intCast(@min(num_platforms, platforms.len));
+    _ = getPlatforms(platform_count, &platforms, null);
     const plat = platforms[0];
     const raw_ptr: *const *const Dispatch = @ptrCast(@alignCast(plat.?));
     global_platform = plat;
@@ -193,7 +194,12 @@ pub const Context = struct {
         }
 
         var devices: [16]cl_device_id = undefined;
-        try check(dispatch.clGetDeviceIDs.?(plat, CL_DEVICE_TYPE_GPU, num_devices, &devices, null));
+        const device_count: cl_uint = @intCast(@min(num_devices, devices.len));
+        if (ordinal >= device_count) {
+            setLastError("Requested GPU device ordinal exceeds driver buffer");
+            return Error.OpenCL;
+        }
+        try check(dispatch.clGetDeviceIDs.?(plat, CL_DEVICE_TYPE_GPU, device_count, &devices, null));
         const dev = devices[ordinal];
 
         const dev_arr = [_]cl_device_id{dev};
@@ -290,6 +296,10 @@ pub const Module = struct {
 pub const Function = struct {
     kernel: cl_kernel,
     context: Context,
+
+    pub fn deinit(self: Function) void {
+        _ = self.context.dispatch.clReleaseKernel.?(self.kernel);
+    }
 
     pub fn launch(self: Function, grid: Dim, block: Dim, args: anytype) Error!void {
         if (grid.x == 0 or grid.y == 0 or grid.z == 0) return;

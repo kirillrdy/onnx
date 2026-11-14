@@ -46,17 +46,23 @@ SamMetalContext *sam_metal_context_create(uint32_t ordinal) {
     }
 }
 
-void sam_metal_context_destroy(SamMetalContext *context) { free(context); }
+void sam_metal_context_destroy(SamMetalContext *context) {
+    if (!context) return;
+    context->last = nil;
+    context->queue = nil;
+    context->device = nil;
+    free(context);
+}
 
 int sam_metal_context_synchronize(SamMetalContext *context) {
     id<MTLCommandBuffer> command = context->last;
     if (!command) return 1;
+    context->last = nil;
     [command waitUntilCompleted];
     if (command.status == MTLCommandBufferStatusError) {
         set_error(command.error.localizedDescription);
         return 0;
     }
-    context->last = nil;
     return 1;
 }
 
@@ -78,7 +84,19 @@ SamMetalModule *sam_metal_module_create(SamMetalContext *context, const char *so
     }
 }
 
-void sam_metal_module_destroy(SamMetalModule *module) { free(module); }
+void sam_metal_module_destroy(SamMetalModule *module) {
+    if (!module) return;
+    module->library = nil;
+    module->context = NULL;
+    free(module);
+}
+
+void sam_metal_function_destroy(SamMetalFunction *function) {
+    if (!function) return;
+    function->pipeline = nil;
+    function->context = NULL;
+    free(function);
+}
 
 SamMetalFunction *sam_metal_function_create(SamMetalModule *module, const char *name) {
     @autoreleasepool {
@@ -108,6 +126,10 @@ int sam_metal_launch(SamMetalFunction *function, SamMetalDim grid, SamMetalDim b
         SamMetalContext *context = function->context;
         id<MTLCommandBuffer> command = [context->queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (!command || !encoder) {
+            set_error(@"could not create Metal command buffer or compute encoder");
+            return 0;
+        }
         [encoder setComputePipelineState:function->pipeline];
         for (size_t i = 0; i < arg_count; ++i) {
             if (args[i].kind == SAM_METAL_BUFFER) {

@@ -242,9 +242,15 @@ const Reader = struct {
     fn skip(self: *Reader, wire: u3) !void {
         switch (wire) {
             0 => _ = try self.varint(),
-            1 => self.pos += 8,
+            1 => {
+                if (self.pos + 8 > self.bytes.len) return error.TruncatedProtobuf;
+                self.pos += 8;
+            },
             2 => _ = try self.slice(),
-            5 => self.pos += 4,
+            5 => {
+                if (self.pos + 4 > self.bytes.len) return error.TruncatedProtobuf;
+                self.pos += 4;
+            },
             else => return error.UnsupportedWireType,
         }
     }
@@ -256,6 +262,7 @@ const Parser = struct {
     directory: []const u8,
     weights: []align(std.heap.page_size_min) u8 = &.{},
     weights_path: []const u8 = &.{},
+    weights_location: []const u8 = &.{},
 
     fn appendF32(self: *Parser, values: *std.ArrayList(f32), r: *Reader, wire: u3) !void {
         if (wire != 2) return values.append(self.arena, @bitCast(try r.fixed32()));
@@ -450,7 +457,8 @@ const Parser = struct {
 
         if (external.len != 0) {
             const blob = try self.externalWeights(external);
-            if (offset + length > blob.len) return error.ExternalDataOutOfRange;
+            const end = std.math.add(u64, offset, length) catch return error.ExternalDataOutOfRange;
+            if (end > blob.len) return error.ExternalDataOutOfRange;
             tensor.data = blob[@intCast(offset)..][0..@intCast(length)];
         }
         if (tensor.data.len != 0 and @intFromPtr(tensor.data.ptr) % 8 != 0) {
@@ -464,10 +472,14 @@ const Parser = struct {
     /// Every initializer in an export points at the same blob, so it is mapped
     /// once and shared. Mapping keeps a 1.8 GiB weight file out of the heap.
     fn externalWeights(self: *Parser, location: []const u8) ![]const u8 {
-        if (self.weights.len != 0) return self.weights;
+        if (self.weights.len != 0) {
+            if (!std.mem.eql(u8, self.weights_location, location)) return error.MultipleExternalWeightFiles;
+            return self.weights;
+        }
         const path = try std.fs.path.join(self.arena, &.{ self.directory, location });
         self.weights = try mapFile(self.io, path);
         self.weights_path = path;
+        self.weights_location = location;
         return self.weights;
     }
 

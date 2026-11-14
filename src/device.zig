@@ -142,6 +142,14 @@ pub const Device = struct {
     }
 
     pub fn deinit(self: *Device) void {
+        inline for (comptime std.meta.fieldNames(Device)) |name| {
+            const Field = @TypeOf(@field(self, name));
+            if (Field == driver.Function) {
+                @field(self, name).deinit();
+            } else if (Field == ?driver.Function) {
+                if (@field(self, name)) |func| func.deinit();
+            }
+        }
         self.module.unload();
         self.context.deinit();
         self.* = undefined;

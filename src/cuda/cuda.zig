@@ -59,8 +59,8 @@ const JitOption = enum(c_uint) {
     error_log_buffer_size_bytes = 6,
 };
 
-var error_buf: [512]u8 = undefined;
-var error_len: usize = 0;
+threadlocal var error_buf: [512]u8 = undefined;
+threadlocal var error_len: usize = 0;
 
 /// Message for the most recent `error.Cuda`.
 pub fn lastError() []const u8 {
@@ -182,6 +182,8 @@ pub const Module = struct {
 
 pub const Function = struct {
     ptr: CUfunction,
+
+    pub fn deinit(_: Function) void {}
 
     /// Launches `grid` blocks of `block` threads. `args` is a tuple whose
     /// fields match the kernel's parameters -- `DevicePtr` for pointers.
