@@ -11,7 +11,6 @@
 // Four, whichever the element is: a half build gains nothing from eight, which
 // costs registers and halves the work items without moving more per cycle.
 // `runtime.lane_step` mirrors it.
-#if SAM3_HALF
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 typedef half real;
 typedef half4 realv;
@@ -21,16 +20,6 @@ typedef float4 floatv;
 #define TO_FLOATV(v) convert_float4(v)
 #define VLOADV vload4
 #define VSTOREV vstore4
-#else
-typedef float real;
-typedef float4 realv;
-typedef float4 floatv;
-#define LANE_STEP 4
-#define TO_REALV(v) (v)
-#define TO_FLOATV(v) (v)
-#define VLOADV vload4
-#define VSTOREV vstore4
-#endif
 
 enum Binary {
     BIN_ADD = 0, BIN_SUB = 1, BIN_MUL = 2, BIN_DIV = 3, BIN_POW = 4,
@@ -304,8 +293,7 @@ __kernel void unaryVec(
 /// table, and adds the two. Here it is one pass over x.
 ///
 /// `period` is how many elements of the tables go by before they repeat, the
-/// same broadcast `wrap` serves elsewhere. `scale` is the constant the graph
-/// follows the sum with, or one where it follows it with nothing.
+/// same broadcast `wrap` serves elsewhere.
 __kernel void rope(
     __global const real* x,
     __global const real* cosine,
@@ -349,12 +337,11 @@ __kernel void copy(
     __global const uint* meta,
     uint rank,
     uint count,
-    uint src_offset,
-    uint dst_offset
+    uint src_offset
 ) {
     uint i = get_global_id(0);
     if (i >= count) return;
-    dst[dst_offset + i] = src[src_offset + offsetOf(i, meta, 0, rank, rank)];
+    dst[i] = src[src_offset + offsetOf(i, meta, 0, rank, rank)];
 }
 
 /// `copy` where the innermost axis is contiguous on both sides, so one work
@@ -368,13 +355,12 @@ __kernel void copyVec(
     __global const uint* meta,
     uint rank,
     uint groups,
-    uint src_offset,
-    uint dst_offset
+    uint src_offset
 ) {
     uint i = get_global_id(0);
     if (i >= groups) return;
     realv group = VLOADV(0, &src[src_offset + offsetOf(i, meta, 0, rank, rank)]);
-    VSTOREV(group, i, &dst[dst_offset]);
+    VSTOREV(group, i, dst);
 }
 
 __kernel void fill(
@@ -720,92 +706,6 @@ __kernel void matmul(
                     float value = acc[i][j] + (has_bias ? (float)bias[col] : 0.0f);
                     c[batch * c_batch + row * n + col] = activation ? gelu(value) : value;
                 }
-            }
-        }
-    }
-}
-
-__kernel void matmulNBits(
-    __global const real* a,
-    __global const uchar* quantized,
-    __global const real* scales,
-    __global real* out,
-    uint m,
-    uint n,
-    uint k,
-    uint block_shift,
-    uint blocks_per_row
-) {
-    __local float a_tile[MM_TILE_M][MM_TILE_K];
-    __local float b_tile[MM_TILE_K][MM_TILE_N];
-
-    uint tx = get_local_id(0);
-    uint ty = get_local_id(1);
-    uint thread = ty * MM_THREADS_X + tx;
-    uint row_base = get_group_id(1) * MM_TILE_M;
-    uint col_base = get_group_id(0) * MM_TILE_N;
-    uint shift = block_shift;
-    uint block_mask = (1u << shift) - 1u;
-    uint blob = 1u << (shift - 1u);
-    uint row_stride = blocks_per_row * blob;
-
-    float acc[MM_ROWS][MM_COLS];
-    for (int i = 0; i < MM_ROWS; i++) {
-        for (int j = 0; j < MM_COLS; j++) acc[i][j] = 0.0f;
-    }
-
-    for (uint step = 0; step < k; step += MM_TILE_K) {
-        for (uint slab = 0; slab < (MM_TILE_M * MM_TILE_K) / MM_STAGE; slab++) {
-            uint idx = thread + slab * MM_STAGE;
-            uint r = idx / MM_TILE_K;
-            uint column = idx % MM_TILE_K;
-            a_tile[r][column] = (row_base + r < m && step + column < k) ?
-                a[(row_base + r) * k + step + column] : 0.0f;
-        }
-
-        for (uint slab = 0; slab < (MM_TILE_K * MM_TILE_N) / MM_STAGE; slab++) {
-            uint idx = thread + slab * MM_STAGE;
-            uint depth = idx / MM_TILE_N;
-            uint column = idx % MM_TILE_N;
-            uint weight_row = col_base + column;
-            uint along = step + depth;
-            float val = 0.0f;
-            if (weight_row < n && along < k) {
-                uint block = along >> shift;
-                uint within = along & block_mask;
-                uchar byte_val = quantized[weight_row * row_stride + block * blob + (within >> 1)];
-                uchar nibble = (within & 1) ? (byte_val >> 4) : (byte_val & 0x0f);
-                val = ((float)nibble - 8.0f) * scales[weight_row * blocks_per_row + block];
-            }
-            b_tile[depth][column] = val;
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        #pragma unroll
-        for (uint depth = 0; depth < MM_TILE_K; depth++) {
-            float a_reg[MM_ROWS];
-            float b_reg[MM_COLS];
-            #pragma unroll
-            for (int i = 0; i < MM_ROWS; i++) a_reg[i] = a_tile[ty + i * MM_THREADS_Y][depth];
-            #pragma unroll
-            for (int j = 0; j < MM_COLS; j++) b_reg[j] = b_tile[depth][tx + j * MM_THREADS_X];
-            #pragma unroll
-            for (int i = 0; i < MM_ROWS; i++) {
-                #pragma unroll
-                for (int j = 0; j < MM_COLS; j++) {
-                    acc[i][j] = fma(a_reg[i], b_reg[j], acc[i][j]);
-                }
-            }
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-
-    for (int i = 0; i < MM_ROWS; i++) {
-        uint row = row_base + ty + i * MM_THREADS_Y;
-        if (row < m) {
-            for (int j = 0; j < MM_COLS; j++) {
-                uint col = col_base + tx + j * MM_THREADS_X;
-                if (col < n) out[row * n + col] = acc[i][j];
             }
         }
     }
@@ -1320,13 +1220,6 @@ __kernel void instanceNorm(
 #pragma OPENCL EXTENSION cl_intel_subgroup_local_block_io : enable
 #pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
 
-/// Tensors are already half when the runtime stores them that way, so the
-/// staging load is then exactly the bytes a mad needs, with no conversion.
-#if SAM3_HALF
-#define DP_TO_HALFV(v) (v)
-#else
-#define DP_TO_HALFV(v) convert_half4(v)
-#endif
 /// How many of a fragment row of sixteen one work item stages at a time.
 #define DP_PARTS (DP_SG / LANE_STEP)
 
@@ -1371,7 +1264,7 @@ inline void stageXmxRows(
         __local half* out = (__local half*)&a_tile[(kb * DP_TILE_M + row) * DP_SG + part * LANE_STEP];
         if (row_base + row < m && along + LANE_STEP - 1 < k && vector) {
             realv v = VLOADV(0, &a[a_base + (row_base + row) * k + along]);
-            VSTOREV(DP_TO_HALFV(v), 0, out);
+            VSTOREV(v, 0, out);
         } else {
             #pragma unroll
             for (int e = 0; e < LANE_STEP; e++) {
@@ -1493,7 +1386,7 @@ __kernel void matmulXmx(
             __local ushort* out = &b_tile[((kb * DP_NBLOCKS + cb) * DP_SG + row) * DP_SG + part * LANE_STEP];
             if (along < k && col + LANE_STEP - 1 < n && b_vector) {
                 realv v = VLOADV(0, &b[b_base + along * n + col]);
-                VSTOREV(DP_TO_HALFV(v), 0, (__local half*)out);
+                VSTOREV(v, 0, (__local half*)out);
             } else {
                 #pragma unroll
                 for (int e = 0; e < LANE_STEP; e++) {
@@ -1547,7 +1440,7 @@ __kernel void matmulXmx(
 // this kernel is never handed. TD_TILE_M, TD_TILE_N and the sub-group count
 // are mirrored in the runtime.
 // ---------------------------------------------------------------------------
-#if defined(cl_intel_subgroup_2d_block_io) && SAM3_HALF
+#if defined(cl_intel_subgroup_2d_block_io)
 #pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable
 
 /// A work group is TD_SG_M by TD_SG_N sub-groups, each holding TD_M_BLOCKS by
@@ -1845,7 +1738,7 @@ __kernel void attention(
             uint kb = (slot / (FA_PARTS * FA_SG)) % FA_KBLOCKS;
             uint db = slot / (FA_PARTS * FA_SG * FA_KBLOCKS);
             realv group = VLOADV(0, &kt[kt_base + (db * FA_SG + depth) * keys + key_base + kb * FA_SG + part * LANE_STEP]);
-            VSTOREV(DP_TO_HALFV(group), 0,
+            VSTOREV(group, 0,
                 (__local half*)&k_tile[((db * FA_KBLOCKS + kb) * FA_SG + depth) * FA_SG + part * LANE_STEP]);
         }
 
@@ -1858,7 +1751,7 @@ __kernel void attention(
             uint db = (slot / (FA_PARTS * FA_SG)) % FA_DBLOCKS;
             uint kb = slot / (FA_PARTS * FA_SG * FA_DBLOCKS);
             realv group = VLOADV(0, &v[v_base + (key_base + kb * FA_SG + key) * FA_HEAD + db * FA_SG + part * LANE_STEP]);
-            VSTOREV(DP_TO_HALFV(group), 0,
+            VSTOREV(group, 0,
                 (__local half*)&v_tile[((kb * FA_DBLOCKS + db) * FA_SG + key) * FA_SG + part * LANE_STEP]);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -1943,7 +1836,7 @@ __kernel void attention(
 /// through and no barrier between the two products -- and no sixteen work
 /// items writing a tile that the sixteen sub-groups then read back. What they
 /// share is a cache line instead.
-#if defined(cl_intel_subgroup_2d_block_io) && SAM3_HALF
+#if defined(cl_intel_subgroup_2d_block_io)
 __attribute__((intel_reqd_sub_group_size(FA_SG)))
 __kernel void attentionBlock(
     __global const real* q,

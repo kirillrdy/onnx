@@ -320,8 +320,8 @@ const Parser = struct {
             switch (f.number) {
                 1 => try nodes.append(self.arena, try self.parseNode(try r.sub())),
                 5 => try initializers.append(self.arena, try self.parseTensor(try r.sub())),
-                11 => try inputs.append(self.arena, try self.parseValueInfo(try r.sub())),
-                12 => try outputs.append(self.arena, try self.parseValueInfo(try r.sub())),
+                11 => try inputs.append(self.arena, try parseValueInfo(try r.sub())),
+                12 => try outputs.append(self.arena, try parseValueInfo(try r.sub())),
                 else => try r.skip(f.wire),
             }
         }
@@ -471,8 +471,7 @@ const Parser = struct {
         return self.weights;
     }
 
-    fn parseValueInfo(self: *Parser, reader: Reader) !ValueInfo {
-        _ = self;
+    fn parseValueInfo(reader: Reader) !ValueInfo {
         var r = reader;
         var info: ValueInfo = .{};
 

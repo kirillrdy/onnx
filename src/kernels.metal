@@ -3,15 +3,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#if SAM3_HALF
 typedef half real;
 typedef half4 realv;
 #define TO_REALV(v) half4(v)
-#else
-typedef float real;
-typedef float4 realv;
-#define TO_REALV(v) (v)
-#endif
 typedef float4 floatv;
 #define LANE_STEP 4
 #define TO_FLOATV(v) float4(v)
@@ -332,7 +326,6 @@ kernel void copy(
     constant uint& rank [[buffer(3)]],
     constant uint& count [[buffer(4)]],
     constant uint& src_offset [[buffer(5)]],
-    constant uint& dst_offset [[buffer(6)]],
     uint3 gid [[thread_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint3 group_id [[threadgroup_position_in_grid]],
@@ -340,7 +333,7 @@ kernel void copy(
 ) {
     uint i = get_global_id(0);
     if (i >= count) return;
-    dst[dst_offset + i] = src[src_offset + offsetOf(i, meta, 0, rank, rank)];
+    dst[i] = src[src_offset + offsetOf(i, meta, 0, rank, rank)];
 }
 
 /// `copy` where the innermost axis is contiguous on both sides, so one work
@@ -355,7 +348,6 @@ kernel void copyVec(
     constant uint& rank [[buffer(3)]],
     constant uint& groups [[buffer(4)]],
     constant uint& src_offset [[buffer(5)]],
-    constant uint& dst_offset [[buffer(6)]],
     uint3 gid [[thread_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint3 group_id [[threadgroup_position_in_grid]],
@@ -364,7 +356,7 @@ kernel void copyVec(
     uint i = get_global_id(0);
     if (i >= groups) return;
     realv group = VLOADV(0, &src[src_offset + offsetOf(i, meta, 0, rank, rank)]);
-    VSTOREV(group, i, &dst[dst_offset]);
+    VSTOREV(group, i, dst);
 }
 
 kernel void fill(
@@ -754,96 +746,6 @@ kernel void matmul(
                     float value = acc[i][j] + (has_bias ? (float)bias[col] : 0.0f);
                     c[batch * c_batch + row * n + col] = activation ? gelu(value) : value;
                 }
-            }
-        }
-    }
-}
-
-kernel void matmulNBits(
-    device const real* a [[buffer(0)]],
-    device const uchar* quantized [[buffer(1)]],
-    device const real* scales [[buffer(2)]],
-    device real* out [[buffer(3)]],
-    constant uint& m [[buffer(4)]],
-    constant uint& n [[buffer(5)]],
-    constant uint& k [[buffer(6)]],
-    constant uint& block_shift [[buffer(7)]],
-    constant uint& blocks_per_row [[buffer(8)]],
-    uint3 gid [[thread_position_in_grid]],
-    uint3 lid [[thread_position_in_threadgroup]],
-    uint3 group_id [[threadgroup_position_in_grid]],
-    uint3 threads_per_group [[threads_per_threadgroup]]
-) {
-    threadgroup float a_tile[MM_TILE_M][MM_TILE_K];
-    threadgroup float b_tile[MM_TILE_K][MM_TILE_N];
-
-    uint tx = get_local_id(0);
-    uint ty = get_local_id(1);
-    uint thread_index = ty * MM_THREADS_X + tx;
-    uint row_base = get_group_id(1) * MM_TILE_M;
-    uint col_base = get_group_id(0) * MM_TILE_N;
-    uint shift = block_shift;
-    uint block_mask = (1u << shift) - 1u;
-    uint blob = 1u << (shift - 1u);
-    uint row_stride = blocks_per_row * blob;
-
-    float acc[MM_ROWS][MM_COLS];
-    for (int i = 0; i < MM_ROWS; i++) {
-        for (int j = 0; j < MM_COLS; j++) acc[i][j] = 0.0f;
-    }
-
-    for (uint step = 0; step < k; step += MM_TILE_K) {
-        for (uint slab = 0; slab < (MM_TILE_M * MM_TILE_K) / MM_STAGE; slab++) {
-            uint idx = thread_index + slab * MM_STAGE;
-            uint r = idx / MM_TILE_K;
-            uint column = idx % MM_TILE_K;
-            a_tile[r][column] = (row_base + r < m && step + column < k) ?
-                a[(row_base + r) * k + step + column] : 0.0f;
-        }
-
-        for (uint slab = 0; slab < (MM_TILE_K * MM_TILE_N) / MM_STAGE; slab++) {
-            uint idx = thread_index + slab * MM_STAGE;
-            uint depth = idx / MM_TILE_N;
-            uint column = idx % MM_TILE_N;
-            uint weight_row = col_base + column;
-            uint along = step + depth;
-            float val = 0.0f;
-            if (weight_row < n && along < k) {
-                uint block = along >> shift;
-                uint within = along & block_mask;
-                uchar byte_val = quantized[weight_row * row_stride + block * blob + (within >> 1)];
-                uchar nibble = (within & 1) ? (byte_val >> 4) : (byte_val & 0x0f);
-                val = ((float)nibble - 8.0f) * scales[weight_row * blocks_per_row + block];
-            }
-            b_tile[depth][column] = val;
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        #pragma unroll
-        for (uint depth = 0; depth < MM_TILE_K; depth++) {
-            float a_reg[MM_ROWS];
-            float b_reg[MM_COLS];
-            #pragma unroll
-            for (int i = 0; i < MM_ROWS; i++) a_reg[i] = a_tile[ty + i * MM_THREADS_Y][depth];
-            #pragma unroll
-            for (int j = 0; j < MM_COLS; j++) b_reg[j] = b_tile[depth][tx + j * MM_THREADS_X];
-            #pragma unroll
-            for (int i = 0; i < MM_ROWS; i++) {
-                #pragma unroll
-                for (int j = 0; j < MM_COLS; j++) {
-                    acc[i][j] = fma(a_reg[i], b_reg[j], acc[i][j]);
-                }
-            }
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-
-    for (int i = 0; i < MM_ROWS; i++) {
-        uint row = row_base + ty + i * MM_THREADS_Y;
-        if (row < m) {
-            for (int j = 0; j < MM_COLS; j++) {
-                uint col = col_base + tx + j * MM_THREADS_X;
-                if (col < n) out[row * n + col] = acc[i][j];
             }
         }
     }
@@ -1380,11 +1282,7 @@ kernel void instanceNorm(
 // instead of walking them one fused multiply-add at a time. Accumulation stays
 // in float -- k runs into the thousands here and a half would not hold the sum.
 
-#if SAM3_HALF
 typedef simdgroup_half8x8 simdgroup_real8x8;
-#else
-typedef simdgroup_float8x8 simdgroup_real8x8;
-#endif
 
 // One work group covers a 64x64 tile of C with eight SIMD groups laid out two
 // deep and four across, so each of them holds a 32x16 corner of it as eight
@@ -1630,85 +1528,6 @@ kernel void matmulTensor(
         auto tB = B.slice(col_base, 0);
         tensorTile(op, tA, tB, tC, bias, has_bias, activation, col_base, n);
     }
-}
-
-// A quantized product on the same tensor units. The operation cannot read
-// packed nibbles, so each work group expands only the 64x64 weight tile it is
-// about to consume. Keeping that tile in threadgroup memory avoids both a
-// graph-sized dequantized copy and repeating the unpack for every output row.
-#define QN_TILE_M 128
-#define QN_TILE_N 64
-#define QN_TILE_K 64
-#define QN_GROUPS 8
-#define QN_THREADS (QN_GROUPS * 32)
-
-kernel void matmulNBitsTensor(
-    device const real* a [[buffer(0)]],
-    device const uchar* quantized [[buffer(1)]],
-    device const real* scales [[buffer(2)]],
-    device real* out [[buffer(3)]],
-    constant uint& m [[buffer(4)]],
-    constant uint& n [[buffer(5)]],
-    constant uint& k [[buffer(6)]],
-    constant uint& block_shift [[buffer(7)]],
-    constant uint& blocks_per_row [[buffer(8)]],
-    uint3 group_id [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]
-) {
-    threadgroup real weights[QN_TILE_K * QN_TILE_N];
-
-    uint row_base = group_id.y * QN_TILE_M;
-    uint col_base = group_id.x * QN_TILE_N;
-    uint block_mask = (1u << block_shift) - 1u;
-    uint blob = 1u << (block_shift - 1u);
-    uint row_stride = blocks_per_row * blob;
-
-    constexpr auto descriptor = matmul2d_descriptor(
-        QN_TILE_M, QN_TILE_N, QN_TILE_K, false, false, false,
-        matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<descriptor, execution_simdgroups<QN_GROUPS>> op;
-
-    auto left = tensor(const_cast<device real*>(a), dextents<int32_t, 2>(k, m));
-    auto staged = tensor((threadgroup real*)weights, dextents<int32_t, 2>(QN_TILE_N, QN_TILE_K));
-    auto result = tensor(out, dextents<int32_t, 2>(n, m));
-    auto first = left.slice(0, row_base);
-    auto target = result.slice(col_base, row_base);
-
-    auto acc = op.get_destination_cooperative_tensor<decltype(first), decltype(staged), float>();
-    #pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < acc.get_capacity(); i++) {
-        if (acc.is_valid_element(i)) acc[i] = 0.0f;
-    }
-
-    for (uint step = 0; step < k; step += QN_TILE_K) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint idx = thread_index; idx < QN_TILE_K * QN_TILE_N; idx += QN_THREADS) {
-            uint depth = idx / QN_TILE_N;
-            uint column = idx % QN_TILE_N;
-            uint weight_row = col_base + column;
-            uint along = step + depth;
-            real value = 0;
-            if (weight_row < n && along < k) {
-                uint block = along >> block_shift;
-                uint within = along & block_mask;
-                uchar packed = quantized[weight_row * row_stride + block * blob + (within >> 1)];
-                uchar nibble = (within & 1) ? (packed >> 4) : (packed & 0x0f);
-                value = (real)(((float)nibble - 8.0f) * (float)scales[weight_row * blocks_per_row + block]);
-            }
-            weights[idx] = value;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        auto tile = left.slice(step, row_base);
-        op.run(tile, staged, acc);
-    }
-
-    auto narrowed = op.get_destination_cooperative_tensor<decltype(first), decltype(staged), real>();
-    #pragma clang loop unroll(full)
-    for (uint16_t i = 0; i < acc.get_capacity(); i++) {
-        if (acc.is_valid_element(i)) narrowed[i] = (real)acc[i];
-    }
-    narrowed.store(target);
 }
 
 // A convolution is the same product over a window that is gathered rather than

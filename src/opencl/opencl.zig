@@ -36,13 +36,13 @@ pub const cl_program = ?*anyopaque;
 pub const cl_kernel = ?*anyopaque;
 
 pub const Dispatch = extern struct {
-    clGetPlatformIDs: ?*const fn (cl_uint, ?[*]cl_platform_id, ?*cl_uint) callconv(.c) cl_int,
-    clGetPlatformInfo: ?*const fn (cl_platform_id, cl_uint, usize, ?*anyopaque, ?*usize) callconv(.c) cl_int,
+    clGetPlatformIDs: ?*const anyopaque,
+    clGetPlatformInfo: ?*const anyopaque,
     clGetDeviceIDs: ?*const fn (cl_platform_id, cl_device_type, cl_uint, ?[*]cl_device_id, ?*cl_uint) callconv(.c) cl_int,
-    clGetDeviceInfo: ?*const fn (cl_device_id, cl_uint, usize, ?*anyopaque, ?*usize) callconv(.c) cl_int,
+    clGetDeviceInfo: ?*const anyopaque,
     clCreateContext: ?*const fn (?[*]const cl_context_properties, cl_uint, [*]const cl_device_id, ?*const fn ([*:0]const u8, ?*const anyopaque, usize, ?*anyopaque) callconv(.c) void, ?*anyopaque, ?*cl_int) callconv(.c) cl_context,
     clCreateContextFromType: ?*const anyopaque,
-    clRetainContext: ?*const fn (cl_context) callconv(.c) cl_int,
+    clRetainContext: ?*const anyopaque,
     clReleaseContext: ?*const fn (cl_context) callconv(.c) cl_int,
     clGetContextInfo: ?*const anyopaque,
     clCreateCommandQueue: ?*const fn (cl_context, cl_device_id, cl_command_queue_properties, ?*cl_int) callconv(.c) cl_command_queue,
@@ -53,7 +53,7 @@ pub const Dispatch = extern struct {
     clCreateBuffer: ?*const fn (cl_context, cl_mem_flags, usize, ?*const anyopaque, ?*cl_int) callconv(.c) cl_mem,
     clCreateImage2D: ?*const anyopaque,
     clCreateImage3D: ?*const anyopaque,
-    clRetainMemObject: ?*const fn (cl_mem) callconv(.c) cl_int,
+    clRetainMemObject: ?*const anyopaque,
     clReleaseMemObject: ?*const fn (cl_mem) callconv(.c) cl_int,
     clGetSupportedImageFormats: ?*const anyopaque,
     clGetMemObjectInfo: ?*const anyopaque,
@@ -63,7 +63,7 @@ pub const Dispatch = extern struct {
     clReleaseSampler: ?*const anyopaque,
     clGetSamplerInfo: ?*const anyopaque,
     clCreateProgramWithSource: ?*const fn (cl_context, cl_uint, [*]const [*:0]const u8, ?[*]const usize, ?*cl_int) callconv(.c) cl_program,
-    clCreateProgramWithBinary: ?*const fn (cl_context, cl_uint, [*]const cl_device_id, [*]const usize, [*]const [*]const u8, ?[*]cl_int, ?*cl_int) callconv(.c) cl_program,
+    clCreateProgramWithBinary: ?*const anyopaque,
     clRetainProgram: ?*const anyopaque,
     clReleaseProgram: ?*const fn (cl_program) callconv(.c) cl_int,
     clBuildProgram: ?*const fn (cl_program, cl_uint, ?[*]const cl_device_id, ?[*:0]const u8, ?*const fn (cl_program, ?*anyopaque) callconv(.c) void, ?*anyopaque) callconv(.c) cl_int,
@@ -72,7 +72,7 @@ pub const Dispatch = extern struct {
     clGetProgramBuildInfo: ?*const fn (cl_program, cl_device_id, cl_uint, usize, ?*anyopaque, ?*usize) callconv(.c) cl_int,
     clCreateKernel: ?*const fn (cl_program, [*:0]const u8, ?*cl_int) callconv(.c) cl_kernel,
     clCreateKernelsInProgram: ?*const anyopaque,
-    clRetainKernel: ?*const fn (cl_kernel) callconv(.c) cl_int,
+    clRetainKernel: ?*const anyopaque,
     clReleaseKernel: ?*const fn (cl_kernel) callconv(.c) cl_int,
     clSetKernelArg: ?*const fn (cl_kernel, cl_uint, usize, ?*const anyopaque) callconv(.c) cl_int,
     clGetKernelInfo: ?*const anyopaque,
@@ -82,7 +82,7 @@ pub const Dispatch = extern struct {
     clRetainEvent: ?*const anyopaque,
     clReleaseEvent: ?*const anyopaque,
     clGetEventProfilingInfo: ?*const anyopaque,
-    clFlush: ?*const fn (cl_command_queue) callconv(.c) cl_int,
+    clFlush: ?*const anyopaque,
     clFinish: ?*const fn (cl_command_queue) callconv(.c) cl_int,
     clEnqueueReadBuffer: ?*const fn (cl_command_queue, cl_mem, cl_uint, usize, usize, ?*anyopaque, cl_uint, ?[*]const ?*anyopaque, ?*?*anyopaque) callconv(.c) cl_int,
     clEnqueueWriteBuffer: ?*const fn (cl_command_queue, cl_mem, cl_uint, usize, usize, ?*const anyopaque, cl_uint, ?[*]const ?*anyopaque, ?*?*anyopaque) callconv(.c) cl_int,
@@ -341,11 +341,10 @@ pub fn Buffer(comptime T: type) type {
 
         ptr: DevicePtr,
         len: usize,
-        context: ?Context = null,
 
         pub fn alloc(len: usize) Error!Self {
             const context = global_context orelse try Context.init(0);
-            if (len == 0) return .{ .ptr = null, .len = 0, .context = context };
+            if (len == 0) return .{ .ptr = null, .len = 0 };
             var status: cl_int = 0;
             const mem = context.dispatch.clCreateBuffer.?(
                 context.context,
@@ -355,14 +354,12 @@ pub fn Buffer(comptime T: type) type {
                 &status,
             );
             try check(status);
-            return .{ .ptr = mem, .len = len, .context = context };
+            return .{ .ptr = mem, .len = len };
         }
 
         pub fn free(self: Self) void {
             if (self.ptr == null) return;
-            if (self.context) |ctx| {
-                _ = ctx.dispatch.clReleaseMemObject.?(@ptrCast(self.ptr));
-            } else if (global_dispatch) |dispatch| {
+            if (global_dispatch) |dispatch| {
                 _ = dispatch.clReleaseMemObject.?(@ptrCast(self.ptr));
             }
         }
@@ -374,7 +371,7 @@ pub fn Buffer(comptime T: type) type {
         pub fn uploadAt(self: Self, offset: usize, host: []const T) Error!void {
             std.debug.assert(offset + host.len <= self.len);
             if (host.len == 0 or self.ptr == null) return;
-            const ctx = self.context orelse global_context orelse return Error.OpenCL;
+            const ctx = global_context orelse return Error.OpenCL;
             try check(ctx.dispatch.clEnqueueWriteBuffer.?(
                 ctx.queue,
                 @ptrCast(self.ptr),
@@ -393,7 +390,7 @@ pub fn Buffer(comptime T: type) type {
         pub fn uploadAsync(self: Self, host: []const T) Error!void {
             std.debug.assert(host.len <= self.len);
             if (host.len == 0 or self.ptr == null) return;
-            const ctx = self.context orelse global_context orelse return Error.OpenCL;
+            const ctx = global_context orelse return Error.OpenCL;
             try check(ctx.dispatch.clEnqueueWriteBuffer.?(
                 ctx.queue,
                 @ptrCast(self.ptr),
@@ -410,7 +407,7 @@ pub fn Buffer(comptime T: type) type {
         pub fn download(self: Self, host: []T) Error!void {
             std.debug.assert(host.len <= self.len);
             if (host.len == 0 or self.ptr == null) return;
-            const ctx = self.context orelse global_context orelse return Error.OpenCL;
+            const ctx = global_context orelse return Error.OpenCL;
             try check(ctx.dispatch.clEnqueueReadBuffer.?(
                 ctx.queue,
                 @ptrCast(self.ptr),
@@ -427,7 +424,7 @@ pub fn Buffer(comptime T: type) type {
         pub fn copy(self: Self, src: Self) Error!void {
             std.debug.assert(src.len <= self.len);
             if (src.len == 0 or self.ptr == null or src.ptr == null) return;
-            const ctx = self.context orelse global_context orelse return Error.OpenCL;
+            const ctx = global_context orelse return Error.OpenCL;
             try check(ctx.dispatch.clEnqueueCopyBuffer.?(
                 ctx.queue,
                 @ptrCast(src.ptr),

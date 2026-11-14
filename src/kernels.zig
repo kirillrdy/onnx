@@ -200,11 +200,10 @@ fn copy(
     rank: u32,
     count: u32,
     src_offset: u32,
-    dst_offset: u32,
 ) callconv(.kernel) void {
     const i = gpu.globalIndex();
     if (i >= count) return;
-    dst[dst_offset + i] = src[src_offset +% offsetOf(i, meta, 0, rank, rank)];
+    dst[i] = src[src_offset +% offsetOf(i, meta, 0, rank, rank)];
 }
 
 fn copyVec(
@@ -214,13 +213,12 @@ fn copyVec(
     rank: u32,
     groups: u32,
     src_offset: u32,
-    dst_offset: u32,
 ) callconv(.kernel) void {
     const i = gpu.globalIndex();
     if (i >= groups) return;
     const src_idx = src_offset +% offsetOf(i, meta, 0, rank, rank);
     const v4 = gpu.loadGlobalFloat4(src + src_idx);
-    gpu.storeGlobalFloat4(dst + dst_offset + i * 4, v4);
+    gpu.storeGlobalFloat4(dst + i * 4, v4);
 }
 
 fn fill(
@@ -1169,84 +1167,6 @@ fn instanceNorm(
     while (i < cols) : (i += width) out[base + i] = (x[base + i] - mean) * inverse * gain + shift;
 }
 
-/// ONNX Runtime's MatMulNBits: A times a weight matrix held as `n` rows of
-/// `k` 4-bit values, one scale per `block_size` of them along a row. A weight
-/// row is an output column, so this computes A x W'.
-///
-/// The weights are unpacked as the tile is staged, which keeps them 4-bit in
-/// memory: an eighth of the traffic of the matrix they stand for, and the only
-/// way the text-prompt models fit in VRAM at all.
-///
-/// Same block tiling as `matmul`, and it needs the same grid.
-fn matmulNBits(
-    a: [*]addrspace(.global) const f32,
-    quantized: [*]addrspace(.global) const u8,
-    scales: [*]addrspace(.global) const f32,
-    out: [*]addrspace(.global) f32,
-    m: u32,
-    n: u32,
-    k: u32,
-    /// log2 of the block size. ONNX requires a power of two, and the host
-    /// checks it, because an integer division here would cost more than the
-    /// unpacking it serves: it sits in the innermost staging loop.
-    block_shift: u32,
-    blocks_per_row: u32,
-) callconv(.kernel) void {
-    const tx = gpu.threadIndex();
-    const ty = gpu.threadIndexY();
-    const thread = ty * mm_threads + tx;
-    const row_base = gpu.blockIndexY() * mm_tile_m;
-    const col_base = gpu.blockIndex() * mm_tile_n;
-    const shift: u5 = @intCast(block_shift);
-    const block_mask = (@as(u32, 1) << shift) - 1;
-    const blob = @as(u32, 1) << (shift - 1);
-    const row_stride = blocks_per_row * blob;
-
-    var acc: [mm_rows][mm_cols]f32 = @splat(@splat(0));
-
-    var step: u32 = 0;
-    while (step < k) : (step += mm_tile_k) {
-        stageLeft(a, 0, row_base, m, k, step, thread);
-        // A weight row is contiguous along `k` and this walks across rows, so
-        // the reads are scattered where the plain matmul's are consecutive.
-        // Staging along `k` instead, to read whole rows, measures the same:
-        // what this kernel is short of is not memory but the unpacking.
-        inline for (0..mm_tile_k * mm_tile_n / mm_stage) |slab| {
-            const index = thread + slab * mm_stage;
-            const depth = index / mm_tile_n;
-            const column = index % mm_tile_n;
-            const weight_row = col_base + column;
-            const along = step + depth;
-
-            var value: f32 = 0;
-            if (weight_row < n and along < k) {
-                const block = along >> shift;
-                const within = along & block_mask;
-                const byte = quantized[weight_row * row_stride + block * blob + (within >> 1)];
-                const nibble: u8 = if (within & 1 == 0) byte & 0xf else byte >> 4;
-                // These exports carry no zero points, which means the
-                // midpoint of the 4-bit range.
-                value = (@as(f32, @floatFromInt(nibble)) - 8.0) * scales[weight_row * blocks_per_row + block];
-            }
-            b_tile[depth][column] = value;
-        }
-        gpu.syncThreads();
-
-        accumulateTiles(&acc, tx, ty);
-        gpu.syncThreads();
-    }
-
-    inline for (0..mm_rows) |i| {
-        const row = row_base + ty + i * mm_threads;
-        if (row < m) {
-            inline for (0..mm_cols) |j| {
-                const col = col_base + tx + j * mm_threads;
-                if (col < n) out[row * n + col] = acc[i][j];
-            }
-        }
-    }
-}
-
 /// Running sum along one axis, one thread per line. The lines are short where
 /// this is used, so walking them in order beats a parallel scan.
 fn cumulativeSum(
@@ -1858,7 +1778,7 @@ fn attention(
 export fn anchor() usize {
     return @intFromPtr(&binary) ^ @intFromPtr(&unary) ^ @intFromPtr(&copy) ^ @intFromPtr(&copyVec) ^
         @intFromPtr(&fill) ^ @intFromPtr(&select) ^ @intFromPtr(&tile) ^ @intFromPtr(&conv2dGemm) ^
-        @intFromPtr(&matmulNBits) ^ @intFromPtr(&cumulativeSum) ^ @intFromPtr(&maxPool2d) ^ @intFromPtr(&avgPool2d) ^ @intFromPtr(&gridSample) ^
+        @intFromPtr(&cumulativeSum) ^ @intFromPtr(&maxPool2d) ^ @intFromPtr(&avgPool2d) ^ @intFromPtr(&gridSample) ^
         @intFromPtr(&sumAxes) ^ @intFromPtr(&resizeNearest) ^ @intFromPtr(&instanceNorm) ^
         @intFromPtr(&clip) ^ @intFromPtr(&scatter) ^
         @intFromPtr(&concatCopy) ^ @intFromPtr(&pad) ^

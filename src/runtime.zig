@@ -68,11 +68,6 @@ const conv_tensor_tile_m = 128;
 const conv_tensor_tile_n = 64;
 const conv_tensor_subgroups = 16;
 
-/// The same for `kernels.matmulNBitsTensor`.
-const matmul_nbits_tensor_tile_m = 128;
-const matmul_nbits_tensor_tile_n = 64;
-const matmul_nbits_tensor_subgroups = 16;
-
 /// The same for `kernels.matmulSimd`, whose work group is eight SIMD groups of
 /// 32 lanes. Kept in step with SG_TILE_M and SG_TILE_N there.
 const matmul_simd_tile_m = 64;
@@ -96,7 +91,7 @@ const matmul_cache_budget = 2 << 20;
 const attention_head = 64;
 const attention_key_step = 16;
 const attention_subgroups = 16;
-const attention_query_tile = if (@hasDecl(driver, "is_opencl")) (8 * attention_subgroups) else 128;
+const attention_query_tile = 128;
 
 /// How many elements one work item of a vector kernel carries, mirroring
 /// LANE_STEP in `kernels.cl`.
@@ -364,6 +359,11 @@ const Tensor = struct {
             .host => Error.NativeRuntime,
         };
     }
+
+    fn alias(self: Tensor, dims: []const i64) Tensor {
+        if (self.data == .gpu) self.data.gpu.references += 1;
+        return .{ .dtype = self.dtype, .dims = dims, .data = self.data };
+    }
 };
 
 /// Several operators the graph spells out that one kernel does whole,
@@ -426,8 +426,7 @@ const SessionState = struct {
     /// its zero points through; see `matmulInteger`.
     column_sums: std.StringHashMapUnmanaged([]const i32) = .empty,
     /// The weights of the fused quantized products, as floats on the device.
-    dequantized: std.StringHashMapUnmanaged(driver.Buffer(Element)) = .empty,
-    dequantized_dims: std.StringHashMapUnmanaged([2]i64) = .empty,
+    dequantized: std.StringHashMapUnmanaged(Dequantized) = .empty,
     /// One-element device buffers by the float they hold, for the operators
     /// that scale by a constant; see `scalar`.
     scalars: std.AutoHashMapUnmanaged(u32, driver.Buffer(Element)) = .empty,
@@ -447,6 +446,11 @@ const SessionState = struct {
     /// Node indices the fusion swallowed, which `run` walks past.
     folded: std.AutoHashMapUnmanaged(usize, void) = .empty,
 
+    const Dequantized = struct {
+        buffer: driver.Buffer(Element),
+        dims: [2]i64,
+    };
+
     fn deinit(self: *SessionState) void {
         const allocator = self.env.allocator;
         var buffers = self.constants.valueIterator();
@@ -459,9 +463,8 @@ const SessionState = struct {
         while (sums.next()) |entry| allocator.free(entry.*);
         self.column_sums.deinit(allocator);
         var dequantized = self.dequantized.valueIterator();
-        while (dequantized.next()) |buffer| buffer.free();
+        while (dequantized.next()) |entry| entry.buffer.free();
         self.dequantized.deinit(allocator);
-        self.dequantized_dims.deinit(allocator);
         var scalars = self.scalars.valueIterator();
         while (scalars.next()) |buffer| buffer.free();
         self.scalars.deinit(allocator);
@@ -1292,14 +1295,14 @@ const SessionState = struct {
             const buffer = try driver.Buffer(Element).alloc(count);
             errdefer buffer.free();
             try uploadFloats(allocator, buffer, floats);
-            try self.dequantized.put(allocator, name, buffer);
+            try self.dequantized.put(allocator, name, .{ .buffer = buffer, .dims = .{ source.dims[0], source.dims[1] } });
         }
 
         // Dequantize and transpose MatMulNBits weights so they can execute
         // through the fast Tensor Core GEMM engine.
         for (self.graph.nodes) |node| {
             if (!std.mem.eql(u8, node.op_type, "MatMulNBits")) continue;
-            if (node.inputs.len < 3) continue;
+            if (node.int("bits", 4) != 4 or node.inputs.len != 3) continue;
             const weights_name = node.inputs[1];
             const scales_name = node.inputs[2];
             if (self.dequantized.contains(weights_name)) continue;
@@ -1345,29 +1348,8 @@ const SessionState = struct {
             const buffer = try driver.Buffer(Element).alloc(total_elements);
             errdefer buffer.free();
             try uploadFloats(allocator, buffer, floats);
-            try self.dequantized.put(allocator, weights_name, buffer);
-            try self.dequantized_dims.put(allocator, weights_name, .{ depth, width });
+            try self.dequantized.put(allocator, weights_name, .{ .buffer = buffer, .dims = .{ depth, width } });
         }
-    }
-
-    /// A fused quantized product: the float product against the weight
-    /// `dequantizeWeights` put on the device, which stands in under the
-    /// weight's own name for the rest of the run.
-    fn dequantizedProduct(
-        self: *SessionState,
-        arena: std.mem.Allocator,
-        values: *std.StringHashMapUnmanaged(*Tensor),
-        node: onnx.Node,
-        plan: Fusion,
-    ) !void {
-        const name = plan.operands[1];
-        if (values.get(name) == null) {
-            const source = self.graph.constant(name) orelse return Error.MissingValue;
-            const buffer = self.dequantized.get(name) orelse return Error.MissingValue;
-            try self.put(arena, values, name, .{ .dtype = .f32, .dims = source.dims, .data = .{ .constant_gpu = buffer } });
-        }
-        const bias = if (plan.arity == 3) plan.operands[2] else null;
-        return self.matmulOf(arena, values, plan.operands[0], name, bias, .none, node.outputs[0]);
     }
 
     /// How much of the weight blob may be resident at once while it is being
@@ -1409,9 +1391,8 @@ const SessionState = struct {
             .attention => self.attention(arena, values, node, plan),
             .gelu => self.unaryOf(arena, values, try self.input(arena, values, plan.operands[0]), node.outputs[0], .gelu, 0),
             .rotary => self.rotary(arena, values, node, plan),
-            .biased_product => self.matmulOf(arena, values, plan.operands[0], plan.operands[1], plan.operands[2], .none, node.outputs[0]),
+            .biased_product, .dequantized_product => self.matmulOf(arena, values, plan.operands[0], plan.operands[1], if (plan.arity == 3) plan.operands[2] else null, .none, node.outputs[0]),
             .biased_product_gelu => self.matmulOf(arena, values, plan.operands[0], plan.operands[1], plan.operands[2], .gelu, node.outputs[0]),
-            .dequantized_product => self.dequantizedProduct(arena, values, node, plan),
             .layer_norm => self.layerNormOf(arena, values, plan.operands[0], plan.operands[1], plan.operands[2], plan.scale, node.outputs[0], null),
         };
         if (std.mem.eql(u8, node.op_type, "Conv")) return self.conv(arena, values, node);
@@ -1426,7 +1407,7 @@ const SessionState = struct {
         if (std.mem.eql(u8, node.op_type, "Concat")) return self.concat(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "Slice")) return self.slice(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "Pad")) return self.pad(arena, values, node);
-        if (std.mem.eql(u8, node.op_type, "MatMul")) return self.matmul(arena, values, node);
+        if (std.mem.eql(u8, node.op_type, "MatMul") or std.mem.eql(u8, node.op_type, "MatMulNBits")) return self.matmul(arena, values, node);
         if (std.meta.stringToEnum(Binary, node.op_type)) |op| return self.binary(arena, values, node, op);
         if (std.mem.eql(u8, node.op_type, "Mod")) return self.binary(arena, values, node, .Div);
         if (std.meta.stringToEnum(Unary, node.op_type)) |op| return self.unary(arena, values, node, op);
@@ -1443,7 +1424,6 @@ const SessionState = struct {
         if (std.mem.eql(u8, node.op_type, "ScatterND")) return self.scatterNd(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "And")) return self.logical(arena, values, node, true);
         if (std.mem.eql(u8, node.op_type, "Or")) return self.logical(arena, values, node, false);
-        if (std.mem.eql(u8, node.op_type, "MatMulNBits")) return self.matmulNBits(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "Constant")) return self.constant(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "GatherND")) return self.gatherNd(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "ReduceSum")) return self.reduceSumOrMean(arena, values, node, false);
@@ -1483,20 +1463,15 @@ const SessionState = struct {
         name: []const u8,
     ) !*Tensor {
         if (values.get(name)) |tensor| return tensor;
-        if (self.dequantized.get(name)) |buffer| {
-            if (self.dequantized_dims.get(name)) |dims| {
-                const tensor = try arena.create(Tensor);
-                const b_dims = try arena.alloc(i64, 2);
-                b_dims[0] = dims[0];
-                b_dims[1] = dims[1];
-                tensor.* = .{
-                    .dtype = .f32,
-                    .dims = b_dims,
-                    .data = .{ .constant_gpu = buffer },
-                };
-                try values.put(arena, name, tensor);
-                return tensor;
-            }
+        if (self.dequantized.get(name)) |entry| {
+            const tensor = try arena.create(Tensor);
+            tensor.* = .{
+                .dtype = .f32,
+                .dims = try arena.dupe(i64, &entry.dims),
+                .data = .{ .constant_gpu = entry.buffer },
+            };
+            try values.put(arena, name, tensor);
+            return tensor;
         }
         return self.materialize(arena, values, name, self.graph.constant(name) orelse return Error.MissingValue);
     }
@@ -1557,21 +1532,6 @@ const SessionState = struct {
         return buffer;
     }
 
-    /// A quantized weight matrix is not float data and never becomes a tensor,
-    /// so it goes to the device as raw bytes, once, and is addressed directly.
-    fn constantBytes(self: *SessionState, name: []const u8) !driver.DevicePtr {
-        if (self.constants.get(name)) |buffer| return buffer.ptr;
-        const source = self.graph.constant(name) orelse return Error.MissingValue;
-        const stride = @sizeOf(Element);
-        const buffer = try driver.Buffer(Element).alloc((source.data.len + stride - 1) / stride);
-        errdefer buffer.free();
-        const bytes: driver.Buffer(u8) = .{ .ptr = buffer.ptr, .len = buffer.len * stride };
-        try bytes.upload(source.data);
-        try self.constants.put(self.env.allocator, name, buffer);
-        self.uploaded_since_release = true;
-        return buffer.ptr;
-    }
-
     fn put(
         _: *SessionState,
         arena: std.mem.Allocator,
@@ -1593,25 +1553,10 @@ const SessionState = struct {
     fn release(self: *SessionState, tensor: *Tensor) void {
         switch (tensor.data) {
             .gpu => |storage| {
-                storage.references -= 1;
-                if (storage.references == 0) {
-                    self.env.pool.give(self.env.allocator, storage.buffer);
-                }
+                self.releaseStorage(storage);
                 tensor.data = .{ .host = &.{} };
             },
             else => {},
-        }
-    }
-
-    fn alias(self: *SessionState, source: *Tensor, dims: []const i64) !Tensor {
-        _ = self;
-        switch (source.data) {
-            .gpu => |storage| {
-                storage.references += 1;
-                return .{ .dtype = source.dtype, .dims = dims, .data = .{ .gpu = storage } };
-            },
-            .constant_gpu => |buffer| return .{ .dtype = source.dtype, .dims = dims, .data = .{ .constant_gpu = buffer } },
-            .host => |bytes| return .{ .dtype = source.dtype, .dims = dims, .data = .{ .host = bytes } },
         }
     }
 
@@ -1889,7 +1834,7 @@ const SessionState = struct {
                     metadata[x.dims.len + d] = dense[d];
                 }
                 const xb = try x.gpuBuffer();
-                try self.strided(xb.ptr, storage.buffer.ptr, metadata[0 .. 2 * x.dims.len], part_count, source_offset, 0);
+                try self.strided(xb.ptr, storage.buffer.ptr, metadata[0 .. 2 * x.dims.len], part_count, source_offset);
                 try self.put(arena, values, output_name, .{ .dtype = .f32, .dims = part_dims, .data = .{ .gpu = storage } });
             } else return Error.UnsupportedDataType;
 
@@ -1910,7 +1855,6 @@ const SessionState = struct {
         given: []u32,
         count: usize,
         src_offset: usize,
-        dst_offset: usize,
     ) !void {
         const metadata = collapseAxes(given);
         const rank = metadata.len / 2;
@@ -1920,7 +1864,7 @@ const SessionState = struct {
             if (rank == 0) break :grouped;
             if (metadata[2 * rank - 1] != 1) break :grouped;
             if (metadata[rank - 1] % lane_step != 0) break :grouped;
-            if (src_offset % lane_step != 0 or dst_offset % lane_step != 0) break :grouped;
+            if (src_offset % lane_step != 0) break :grouped;
             // A stride that is not a whole number of groups would put a work
             // item astride two of them. Slice spells a reversed axis as a
             // negative stride, whose bit pattern fails this too.
@@ -1938,7 +1882,6 @@ const SessionState = struct {
                 @as(u32, @intCast(rank)),
                 @as(u32, @intCast(groups)),
                 @as(u32, @intCast(src_offset)),
-                @as(u32, @intCast(dst_offset)),
             });
         }
         try self.env.uploadMetadata(metadata);
@@ -1949,7 +1892,6 @@ const SessionState = struct {
             @as(u32, @intCast(rank)),
             @as(u32, @intCast(count)),
             @as(u32, @intCast(src_offset)),
-            @as(u32, @intCast(dst_offset)),
         });
     }
 
@@ -2006,17 +1948,11 @@ const SessionState = struct {
         // and the kernel takes them unsigned.
         const ids_count = try indices.count();
         const resolved = try arena.alloc(u32, ids_count);
-        for (0..ids_count) |i| {
-            const raw_id: i64 = switch (indices.dtype) {
-                .i64 => (try indices.i64s())[i],
-                .i32 => @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, indices.data.host)))[i],
-                .u8 => indices.data.host[i],
-                .i8 => @as(i8, @bitCast(indices.data.host[i])),
-                else => return Error.UnsupportedDataType,
-            };
+        for (resolved, 0..) |*slot, i| {
+            const raw_id = try indices.element(i);
             const normalized = if (raw_id < 0) @as(i64, @intCast(axis_len)) + raw_id else raw_id;
             if (normalized < 0 or normalized >= axis_len) return Error.InvalidShape;
-            resolved[i] = @intCast(normalized);
+            slot.* = @intCast(normalized);
         }
 
         if (data.onHost()) {
@@ -2076,7 +2012,7 @@ const SessionState = struct {
         }
         if (inferred) |i| dims[i] = @intCast(try x.count() / known);
         if (try elementCount(dims) != try x.count()) return Error.InvalidShape;
-        try self.put(arena, values, node.outputs[0], try self.alias(x, dims));
+        try self.put(arena, values, node.outputs[0], x.alias(dims));
     }
 
     fn unsqueeze(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
@@ -2096,7 +2032,7 @@ const SessionState = struct {
                 source += 1;
             }
         }
-        try self.put(arena, values, node.outputs[0], try self.alias(x, dims));
+        try self.put(arena, values, node.outputs[0], x.alias(dims));
     }
 
     fn squeeze(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
@@ -2112,7 +2048,7 @@ const SessionState = struct {
                 if (dim != 1) return Error.InvalidShape;
             } else try dims_list.append(arena, dim);
         }
-        try self.put(arena, values, node.outputs[0], try self.alias(x, dims_list.items));
+        try self.put(arena, values, node.outputs[0], x.alias(dims_list.items));
     }
 
     fn transpose(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
@@ -2143,7 +2079,7 @@ const SessionState = struct {
         for (dims, 0..) |dim, i| metadata[i] = @intCast(dim);
         @memcpy(metadata[rank..][0..rank], source_strides[0..rank]);
         const xb = try x.gpuBuffer();
-        try self.strided(xb.ptr, storage.buffer.ptr, metadata[0 .. 2 * rank], count, 0, 0);
+        try self.strided(xb.ptr, storage.buffer.ptr, metadata[0 .. 2 * rank], count, 0);
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
@@ -2246,13 +2182,10 @@ const SessionState = struct {
         if (x.dims.len > max_rank) return if (x.onHost()) Error.RankTooLarge else Error.UnsupportedOperator;
         var dense: [max_rank]u32 = @splat(1);
         denseStrides(x.dims, &dense);
+        const count = try elementCount(dims);
         if (x.onHost()) {
-            // Whole elements move at once, which makes the copy independent of
-            // what the elements are.
-            const size = x.dtype.size();
-            if (size == 0) return Error.UnsupportedDataType;
-            const out = try arena.alignedAlloc(u8, .@"8", try elementCount(dims) * size);
-            for (0..out.len / size) |output_index| {
+            const sources = try arena.alloc(usize, count);
+            for (sources, 0..) |*source, output_index| {
                 var remaining = output_index;
                 var source_index: usize = 0;
                 var axis = dims.len;
@@ -2263,8 +2196,9 @@ const SessionState = struct {
                     const idx = offsets[axis] + @as(i64, @intCast(coordinate)) * step_by_axis[axis];
                     source_index += @as(usize, @intCast(idx)) * dense[axis];
                 }
-                @memcpy(out[output_index * size ..][0..size], x.data.host[source_index * size ..][0..size]);
+                source.* = source_index;
             }
+            const out = try hostSelect(arena, x.*, sources);
             return self.put(arena, values, node.outputs[0], .{ .dtype = x.dtype, .dims = dims, .data = .{ .host = out } });
         }
         if (x.dtype != .f32) return Error.UnsupportedOperator;
@@ -2276,11 +2210,10 @@ const SessionState = struct {
             metadata[x.dims.len + i] = @bitCast(@as(i32, @intCast(stride)));
             source_offset += @as(usize, @intCast(offsets[i])) * dense[i];
         }
-        const count = try elementCount(dims);
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
         const xb = try x.gpuBuffer();
-        try self.strided(xb.ptr, storage.buffer.ptr, metadata[0 .. 2 * x.dims.len], count, source_offset, 0);
+        try self.strided(xb.ptr, storage.buffer.ptr, metadata[0 .. 2 * x.dims.len], count, source_offset);
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
@@ -2741,7 +2674,7 @@ const SessionState = struct {
                 @intCast(outer),        @intCast(inner), @intCast(cols),
                 @intCast(cols * inner), 1,               @intCast(inner),
             };
-            try self.strided(xb.ptr, buffer.buffer.ptr, &metadata, count, 0, 0);
+            try self.strided(xb.ptr, buffer.buffer.ptr, &metadata, count, 0);
         }
         // A power of two, since the fallback tree reduction halves it, and
         // capped well below the hardware maximum: a row is reduced twice, and a
@@ -2759,7 +2692,7 @@ const SessionState = struct {
                 @intCast(outer),        @intCast(cols), @intCast(inner),
                 @intCast(inner * cols), 1,              @intCast(cols),
             };
-            try self.strided(buffer.buffer.ptr, storage.buffer.ptr, &metadata, count, 0, 0);
+            try self.strided(buffer.buffer.ptr, storage.buffer.ptr, &metadata, count, 0);
         }
         const dims = try arena.dupe(i64, x.dims);
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
@@ -2791,17 +2724,11 @@ const SessionState = struct {
             var bstrides: [max_rank]u32 = @splat(0);
             makeBroadcastStrides(a.dims, dims, &astrides);
             makeBroadcastStrides(b.dims, dims, &bstrides);
-            const a_count = try a.count();
-            const b_count = try b.count();
-            const av = try arena.alloc(i64, a_count);
-            for (0..a_count) |i| av[i] = if (a.dtype == .i64) (try a.i64s())[i] else @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, a.data.host)))[i];
-            const bv = try arena.alloc(i64, b_count);
-            for (0..b_count) |i| bv[i] = if (b.dtype == .i64) (try b.i64s())[i] else @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, b.data.host)))[i];
 
             const out = try arena.alloc(i64, try elementCount(dims));
             for (out, 0..) |*value, i| {
-                const x = av[hostOffset(i, dims, &astrides)];
-                const y = bv[hostOffset(i, dims, &bstrides)];
+                const x = try a.element(hostOffset(i, dims, &astrides));
+                const y = try b.element(hostOffset(i, dims, &bstrides));
                 value.* = switch (op) {
                     .Add => x + y,
                     .Sub => x - y,
@@ -3283,7 +3210,7 @@ const SessionState = struct {
             @as(i64, @intCast(try elementCount(x.dims[0..axis]))),
             @as(i64, @intCast(try elementCount(x.dims[axis..]))),
         });
-        try self.put(arena, values, node.outputs[0], try self.alias(x, dims));
+        try self.put(arena, values, node.outputs[0], x.alias(dims));
     }
 
     /// And and Or over the booleans a graph's control flow is written in.
@@ -3305,62 +3232,6 @@ const SessionState = struct {
             value.* = @intFromBool(if (conjunction) x and y else x or y);
         }
         try self.put(arena, values, node.outputs[0], .{ .dtype = .bool, .dims = dims, .data = .{ .host = out } });
-    }
-
-    /// ONNX Runtime's MatMulNBits. The weight matrix is 4-bit and transposed,
-    /// so it neither goes through `input` nor through the plain matmul.
-    fn matmulNBits(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
-        if (self.dequantized.contains(node.inputs[1])) {
-            const a = try self.input(arena, values, node.inputs[0]);
-            if (a.dims.len >= 2) {
-                return self.matmulOf(arena, values, node.inputs[0], node.inputs[1], null, .none, node.outputs[0]);
-            }
-        }
-        const a = try self.input(arena, values, node.inputs[0]);
-        // Zero points, a group index or a bias would each need their own
-        // handling, and none of SAM 3's exports carry them.
-        if (node.int("bits", 4) != 4 or node.inputs.len > 3) return Error.UnsupportedOperator;
-
-        const depth = node.int("K", 0);
-        const width = node.int("N", 0);
-        const block_size = node.int("block_size", 0);
-        // ONNX requires a power of two no smaller than 16; the kernel relies
-        // on it to unpack with a shift rather than a division.
-        if (depth <= 0 or width <= 0 or block_size < 2) return Error.InvalidShape;
-        if (!std.math.isPowerOfTwo(@as(u64, @intCast(block_size)))) return Error.UnsupportedOperator;
-        if (a.dims.len == 0 or a.dims[a.dims.len - 1] != depth) return Error.InvalidShape;
-        const blocks_per_row = @divFloor(depth + block_size - 1, block_size);
-
-        const dims = try arena.dupe(i64, a.dims);
-        dims[dims.len - 1] = width;
-        const rows = try elementCount(a.dims[0 .. a.dims.len - 1]);
-
-        const storage = try self.newStorage(try elementCount(dims));
-        errdefer self.releaseStorage(storage);
-        const ab = try a.gpuBuffer();
-        const weights = try self.constantBytes(node.inputs[1]);
-        const scales = try (try self.input(arena, values, node.inputs[2])).gpuBuffer();
-
-        const tensor_kernel = self.env.gpu.matmul_nbits_tensor;
-        const tile_m: i64 = if (tensor_kernel != null) matmul_nbits_tensor_tile_m else matmul_tile_m;
-        const tile_n: i64 = if (tensor_kernel != null) matmul_nbits_tensor_tile_n else matmul_tile_n;
-        const subgroups: u32 = if (tensor_kernel != null) matmul_nbits_tensor_subgroups else 16;
-        const kernel = tensor_kernel orelse self.env.gpu.matmul_nbits;
-        try kernel.launch(.{
-            .x = @intCast(@divFloor(width + tile_n - 1, tile_n)),
-            .y = @intCast(@divFloor(@as(i64, @intCast(rows)) + tile_m - 1, tile_m)),
-        }, .{ .x = 16, .y = subgroups }, .{
-            ab.ptr,
-            weights,
-            scales.ptr,
-            storage.buffer.ptr,
-            @as(u32, @intCast(rows)),
-            @as(u32, @intCast(width)),
-            @as(u32, @intCast(depth)),
-            @as(u32, @ctz(@as(u32, @intCast(block_size)))),
-            @as(u32, @intCast(blocks_per_row)),
-        });
-        try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
     fn cumulativeSum(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
@@ -3661,7 +3532,7 @@ const SessionState = struct {
             try self.put(arena, values, body.inputs[0].name, .{ .dtype = .i64, .dims = &.{}, .data = .{ .host = std.mem.sliceAsBytes(counter) } });
             try self.put(arena, values, body.inputs[1].name, .{ .dtype = .bool, .dims = &.{}, .data = .{ .host = try arena.dupe(u8, &.{1}) } });
             for (body.inputs[2..], state) |info, tensor| {
-                try self.put(arena, values, info.name, try self.alias(tensor, tensor.dims));
+                try self.put(arena, values, info.name, tensor.alias(tensor.dims));
                 try fresh.append(arena, values.get(info.name).?);
             }
 
@@ -3679,7 +3550,7 @@ const SessionState = struct {
                 stacked[0] = 1;
                 @memcpy(stacked[1..], tensor.dims);
                 const name = try std.fmt.allocPrint(arena, "{s}\x00{d}", .{ info.name, iteration });
-                try self.put(arena, values, name, try self.alias(tensor, stacked));
+                try self.put(arena, values, name, tensor.alias(stacked));
                 try names.append(arena, name);
             }
 
@@ -3691,7 +3562,7 @@ const SessionState = struct {
         }
 
         for (node.outputs[0..carried], state) |name, tensor| {
-            try self.put(arena, values, name, try self.alias(tensor, tensor.dims));
+            try self.put(arena, values, name, tensor.alias(tensor.dims));
             if (state_owned) self.release(tensor);
         }
         for (node.outputs[carried..], stashed) |name, names| {
@@ -3713,7 +3584,7 @@ const SessionState = struct {
 
     fn identity(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
         const x = try self.input(arena, values, node.inputs[0]);
-        try self.put(arena, values, node.outputs[0], try self.alias(x, try arena.dupe(i64, x.dims)));
+        try self.put(arena, values, node.outputs[0], x.alias(try arena.dupe(i64, x.dims)));
     }
 
     /// Comparisons only ever appear in the shape arithmetic of this export, so
@@ -3794,7 +3665,7 @@ const SessionState = struct {
                 } else {
                     const selected = if (selected_true) a else b;
                     if (std.mem.eql(i64, selected.dims, dims))
-                        return self.put(arena, values, node.outputs[0], try self.alias(selected, dims));
+                        return self.put(arena, values, node.outputs[0], selected.alias(dims));
                 }
             }
         }
@@ -3877,16 +3748,12 @@ const SessionState = struct {
         const x = try self.input(arena, values, node.inputs[0]);
         const to: onnx.DataType = @enumFromInt(@as(u32, @intCast(node.int("to", @intFromEnum(x.dtype)))));
         const dims = try arena.dupe(i64, x.dims);
-        if (to == x.dtype) return self.put(arena, values, node.outputs[0], try self.alias(x, dims));
+        if (to == x.dtype) return self.put(arena, values, node.outputs[0], x.alias(dims));
 
         const count = try x.count();
         if (to == .f32) {
             if (!x.onHost()) return Error.UnsupportedDataType;
-            const out = try arena.alloc(f32, count);
-            for (out, 0..) |*value, i| value.* = @floatFromInt(try x.element(i));
-            const storage = try self.newStorage(count);
-            errdefer self.releaseStorage(storage);
-            try stageFloats(arena, storage.buffer, out);
+            const storage = try self.deviceMask(arena, x.*);
             return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
         }
 
@@ -3959,7 +3826,7 @@ const SessionState = struct {
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
         const xb = try x.gpuBuffer();
-        try self.strided(xb.ptr, storage.buffer.ptr, metadata[0 .. 2 * rank], count, 0, 0);
+        try self.strided(xb.ptr, storage.buffer.ptr, metadata[0 .. 2 * rank], count, 0);
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
@@ -4206,7 +4073,7 @@ const SessionState = struct {
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
         const db = try data.gpuBuffer();
-        try self.strided(db.ptr, storage.buffer.ptr, metadata[0 .. 2 * rank], count, 0, 0);
+        try self.strided(db.ptr, storage.buffer.ptr, metadata[0 .. 2 * rank], count, 0);
 
         try self.ensureIndices(offsets.len);
         try self.env.indices.upload(offsets);
@@ -4776,9 +4643,6 @@ const SessionState = struct {
     }
 };
 
-/// Compares a string attribute against what a kernel actually implements,
-/// standing ONNX's own default in when the attribute is absent. Several of
-/// those defaults are not what is implemented here, so they have to be named.
 /// One MatMulInteger, shaped for the host: a block of activation rows against
 /// a range of weight columns at a time, so the block's accumulators stay in
 /// the first-level cache while the weight streams through once per block.
@@ -4886,6 +4750,9 @@ fn intersectionOverUnion(a: *const [4]f32, b: *const [4]f32, centered: bool) f32
     return if (total <= 0) 0 else overlap / total;
 }
 
+/// Compares a string attribute against what a kernel actually implements,
+/// standing ONNX's own default in when the attribute is absent. Several of
+/// those defaults are not what is implemented here, so they have to be named.
 fn attributeIs(node: onnx.Node, name: []const u8, default: []const u8, expected: []const u8) bool {
     const attribute = node.attribute(name) orelse return std.mem.eql(u8, default, expected);
     return std.mem.eql(u8, if (attribute.s.len == 0) default else attribute.s, expected);
@@ -4899,9 +4766,7 @@ fn elementCount(dims: []const i64) !usize {
     }
     return count;
 }
-/// Pooled output extent along one axis. With `ceil_mode` the last window may
-/// overhang, but ONNX Runtime drops a window that would start past the
-/// padded input.
+
 /// Whether `auto_pad` asks for SAME padding and, if so, whether the odd row of
 /// it goes on the far side (SAME_UPPER) or the near side (SAME_LOWER). VALID
 /// and NOTSET both read null: no padding beyond what `pads` says.
@@ -4920,6 +4785,9 @@ fn samePadding(input: i64, window: i64, stride: i64, upper: bool) [2]i64 {
     return if (upper) .{ near, total - near } else .{ total - near, near };
 }
 
+/// Pooled output extent along one axis. With `ceil_mode` the last window may
+/// overhang, but ONNX Runtime drops a window that would start past the
+/// padded input.
 fn pooledExtent(input: i64, kernel: i64, stride: i64, pad_begin: i64, pad_end: i64, ceil_mode: bool) i64 {
     const span = input + pad_begin + pad_end - kernel;
     var extent = if (ceil_mode) @divFloor(span + stride - 1, stride) + 1 else @divFloor(span, stride) + 1;

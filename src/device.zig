@@ -2,7 +2,6 @@
 //! the driver directly (CUDA, OpenCL, or Apple Metal); it does not link ONNX Runtime.
 
 const std = @import("std");
-const build_options = @import("build_options");
 pub const driver = @import("gpu_driver");
 
 /// What a float tensor is stored as on the device. Every operator but the
@@ -10,16 +9,9 @@ pub const driver = @import("gpu_driver");
 /// element halves most of what a graph costs -- and it is the precision an
 /// Intel GPU execution provider runs these graphs at anyway. Graph inputs and
 /// outputs stay float; the conversion happens at the boundary.
-pub const Element = if (build_options.half) f16 else f32;
+pub const Element = if (@hasDecl(driver, "is_opencl") or @hasDecl(driver, "is_metal")) f16 else f32;
 
-const kernels_data = @embedFile("kernels");
-
-/// The OpenCL source is compiled by the driver at load, so the element type is
-/// a define rather than a second copy of the file.
-const kernels_source: [:0]const u8 = if (build_options.half)
-    "#define SAM3_HALF 1\n" ++ kernels_data
-else
-    kernels_data;
+const kernels_source: [:0]const u8 = @embedFile("kernels");
 
 pub const Device = struct {
     context: driver.Context,
@@ -79,10 +71,6 @@ pub const Device = struct {
     /// The same on the Apple neural accelerators, which read the window this
     /// gathers for them out of threadgroup memory.
     conv2d_gemm_tensor: ?driver.Function,
-    matmul_nbits: driver.Function,
-    /// Dequantizes one weight tile into threadgroup memory and takes its
-    /// product on the Apple neural accelerators.
-    matmul_nbits_tensor: ?driver.Function,
     cumulative_sum: driver.Function,
     max_pool2d: driver.Function,
     avg_pool2d: driver.Function,
@@ -140,8 +128,6 @@ pub const Device = struct {
             .conv2d_gemm = try module.function("conv2dGemm"),
             .conv2d_gemm_xmx = module.function("conv2dGemmXmx") catch null,
             .conv2d_gemm_tensor = module.function("conv2dGemmTensor") catch null,
-            .matmul_nbits = try module.function("matmulNBits"),
-            .matmul_nbits_tensor = module.function("matmulNBitsTensor") catch null,
             .cumulative_sum = try module.function("cumulativeSum"),
             .max_pool2d = try module.function("maxPool2d"),
             .avg_pool2d = try module.function("avgPool2d"),
